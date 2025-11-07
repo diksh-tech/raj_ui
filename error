@@ -1,0 +1,25 @@
+The error message Error: connect ECONNREFUSED 127.0.0.1:52946 means that your request to 127.0.0.1 (localhost) on port 52946 was refused. This typically happens when:
+
+The server you are trying to reach is not running on your local machine.
+The server is running, but not listening on port 52946.
+There is a firewall or security software blocking the connection.
+The server crashed or was stopped after you started Postman.
+How to troubleshoot:
+
+Make sure the backend server or API you want to connect to is running on your machine.
+Double-check that it is listening on port 52946.
+Try opening 
+http://127.0.0.1:52946
+ in your browser to see if you get any response.
+If you are running the server in a container (like Docker), ensure the port is mapped to your host.
+If you recently changed the port, update the request URL in Postman.
+Would you like help setting up a local server, or do you want to check if the port is open? Let me know what you're trying to connect to, and I can guide you further!
+INFO:     Started reloader process [368] using StatReload
+INFO:     Started server process [15192]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     127.0.0.1:52946 - "OPTIONS /get_data HTTP/1.1" 400 Bad Request
+INFO:     127.0.0.1:51523 - "OPTIONS /get_data HTTP/1.1" 400 Bad Request
+INFO:     127.0.0.1:50611 - "OPTIONS /get_data HTTP/1.1" 400 Bad Request
+INFO:     127.0.0.1:58430 - "OPTIONS /get_data HTTP/1.1" 400 Bad Request
+INFO:     127.0.0.1:58430 - "OPTIONS /get_data HTTP/1.1" 400 Bad Request
