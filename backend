@@ -1234,3 +1234,9 @@ if __name__ == "__main__":
         logger.exception("Failed to start MCP server: %s", str(e))
         raise
 
+##################################################
+(agui) PS C:\Users\Deeksha.x.Srivastava\OneDrive - InterGlobe Aviation Limited\Desktop\new_mcp_ui\backend> python .\mcp_server.py
+INFO:flightops.mcp.server:Starting FlightOps MCP Server
+INFO:flightops.mcp.server:Host: 127.0.0.1, Port: 8000, Transport: streamable-http
+INFO:flightops.mcp.server:MongoDB: mongodb+srv://joc-dbuser:n5cqzIJSl319TZN6@mongo-airlineops-az-ddb01-pl-0.npznw.mongodb.net/, DB: jocflightdb_30jan, Collection: flight
+WARNING:flightops.mcp.server:run_http not available in FastMCP version; using mcp.run()
