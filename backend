@@ -1600,4 +1600,81 @@ export default function App() {
     </div>
   );
 }
+#######################################################
+async function startRun() {
+  if (!query.trim()) return;
+  setTranscript("");
+  setToolLogs([]);
+  setProgress(null);
+  setIsThinking(true);
+  setRunId(null);
+  setShowConfirm(null);
+
+  if (controllerRef.current) {
+    controllerRef.current.abort();
+    controllerRef.current = null;
+  }
+  const controller = new AbortController();
+  controllerRef.current = controller;
+
+  try {
+    console.log("[DEBUG] Fetching:", BACKEND_URL);
+    const res = await fetch(BACKEND_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ userprompt: query }),
+      signal: controller.signal,
+    });
+
+    console.log("[DEBUG] response.ok:", res.ok, "status:", res.status);
+    console.log("[DEBUG] content-type:", res.headers.get("content-type"));
+
+    if (!res.ok) {
+      const text = await res.text();
+      console.error("[DEBUG] HTTP error body:", text);
+      pushToolLog({ type: "error", content: `HTTP ${res.status}: ${text}` });
+      setIsThinking(false);
+      return;
+    }
+
+    // stream reader debug
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder("utf-8");
+    let buffer = "";
+
+    console.log("[DEBUG] starting read loop...");
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        console.log("[DEBUG] stream done");
+        break;
+      }
+      const chunkText = decoder.decode(value, { stream: true });
+      console.log("[DEBUG] RAW CHUNK:", chunkText.slice(0, 500)); // print first 500 chars
+      buffer += chunkText;
+
+      const [chunks, rest] = parseSSEChunks(buffer);
+      buffer = rest;
+
+      if (chunks.length) {
+        console.log(`[DEBUG] parsed ${chunks.length} SSE chunk(s)`);
+      }
+      for (const chunk of chunks) {
+        console.log("[DEBUG] SSE event:", chunk.event, "data:", chunk.data);
+        handleEvent(chunk.event, chunk.data);
+      }
+    }
+  } catch (err) {
+    console.error("[DEBUG] fetch error:", err);
+    if (err.name === "AbortError") {
+      pushToolLog({ type: "info", content: "Stream aborted by user." });
+    } else {
+      pushToolLog({ type: "error", content: `Stream error: ${err?.message || String(err)}` });
+    }
+  } finally {
+    setIsThinking(false);
+    controllerRef.current = null;
+  }
+}
 
