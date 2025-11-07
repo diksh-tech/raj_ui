@@ -1,3 +1,56 @@
+def _call_azure_openai(self, messages: list, temperature: float = 0.2, max_tokens: int = 2048) -> str:
+    try:
+        completion = client_azure.chat.completions.create(
+            model=AZURE_OPENAI_DEPLOYMENT,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        # DEBUG: print entire choice payload so we can inspect what the model returned
+        try:
+            import json, pathlib
+            raw = completion.choices[0].message.content
+            logger.warning("LLM RAW RESPONSE (first 2000 chars): %s", raw[:2000])
+            # save full raw to file for inspection (useful if it's long)
+            pathlib.Path("llm_raw_response.txt").write_text(raw, encoding="utf-8")
+        except Exception as e:
+            logger.exception("Failed to log LLM raw response: %s", e)
+
+        return completion.choices[0].message.content
+    except Exception as e:
+        logger.error(f"Azure OpenAI API error: {e}")
+        return json.dumps({"error": str(e)})
+#######################################################################
+        cleaned = content.strip()
+        if cleaned.startswith("```"):
+            cleaned = cleaned.strip("`")
+            if cleaned.lower().startswith("json"):
+                cleaned = cleaned[4:].strip()
+            cleaned = cleaned.replace("```", "").strip()
+
+        # DEBUG: log cleaned output before JSON parse
+        logger.warning("LLM CLEANED PLAN (first 2000 chars): %s", cleaned[:2000])
+        try:
+            pathlib.Path("llm_cleaned_plan.txt").write_text(cleaned, encoding="utf-8")
+        except Exception:
+            pass
+
+        try:
+            plan = json.loads(cleaned)
+            if isinstance(plan, dict) and "plan" in plan:
+                return plan
+            else:
+                logger.warning("⚠️ LLM output did not contain 'plan' key.")
+                return {"plan": []}
+        except json.JSONDecodeError:
+            logger.warning(f"❌ Could not parse LLM plan output after cleaning. Returning raw text plan.")
+            # include the raw text in logs so we can inspect
+            logger.warning("LLM UNPARSED OUTPUT (first 2000 chars): %s", cleaned[:2000])
+            return {"plan": []}
+#################################################################################
+**IMPORTANT**: Respond *only* with a single JSON object with the key "plan". Do not add any explanation, extra text, or markdown fences. Example: {"plan":[ ... ]}
+
+#########################################################################################################################
 // src/App.jsx
 import React, { useState, useRef, useEffect } from "react";
 import { parseSSEChunks } from "./sseHelpers";
