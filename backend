@@ -1,0 +1,662 @@
+# backend/flightops_mcp_client.py
+import os
+import json
+import logging
+import asyncio
+from uuid import uuid4
+from dotenv import load_dotenv
+from openai import AzureOpenAI
+from mcp import ClientSession
+from mcp.client.streamable_http import streamablehttp_client
+from typing import Callable, Any
+
+load_dotenv()
+logger = logging.getLogger("FlightOps.MCPClient")
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+
+MCP_SERVER_URL = os.getenv("MCP_SERVER_URL", "http://127.0.0.1:8000").rstrip("/")
+AZURE_OPENAI_KEY = os.getenv("AZURE_OPENAI_KEY")
+AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
+AZURE_OPENAI_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
+AZURE_API_VERSION = os.getenv("AZURE_API_VERSION", "2024-12-01-preview")
+
+if not AZURE_OPENAI_KEY:
+    raise RuntimeError("AZURE_OPENAI_KEY not set in environment")
+
+client_azure = AzureOpenAI(
+    api_key=AZURE_OPENAI_KEY,
+    api_version=AZURE_API_VERSION,
+    azure_endpoint=AZURE_OPENAI_ENDPOINT
+)
+
+# Simple TOOLS registry example placeholder (if you need)
+try:
+    from tool_registry import TOOLS  # optional; your project may have this
+except Exception:
+    TOOLS = {}
+
+# -- System prompts (same as your original) --
+SYSTEM_PROMPT_PLAN = os.getenv("SYSTEM_PROMPT_PLAN", """
+You are an assistant that converts user questions into MCP tool calls.
+... (use the longer prompt from your earlier code if needed)
+""")
+
+SYSTEM_PROMPT_SUMMARIZE = os.getenv("SYSTEM_PROMPT_SUMMARIZE", """
+You are an assistant that summarizes tool outputs into a concise answer.
+""")
+
+# Helper chunker
+def chunk_text(text, size=120):
+    words = text.split()
+    cur = ""
+    for w in words:
+        if len(cur) + len(w) + 1 > size:
+            yield cur.strip()
+            cur = w
+        else:
+            cur = (cur + " " + w).strip()
+    if cur:
+        yield cur.strip()
+
+class FlightOpsMCPClient:
+    def __init__(self, base_url: str = None):
+        self.base_url = (base_url or MCP_SERVER_URL).rstrip("/")
+        self.session = None
+        self._client_context = None
+
+    async def connect(self):
+        logger.info(f"Connecting to MCP at {self.base_url}")
+        self._client_context = streamablehttp_client(self.base_url)
+        read_stream, write_stream, _ = await self._client_context.__aenter__()
+        self.session = ClientSession(read_stream, write_stream)
+        await self.session.__aenter__()
+        await self.session.initialize()
+        logger.info("Connected to MCP server")
+
+    async def disconnect(self):
+        try:
+            if self.session:
+                await self.session.__aexit__(None, None, None)
+            if self._client_context:
+                await self._client_context.__aexit__(None, None, None)
+            logger.info("Disconnected from MCP")
+        except Exception as e:
+            logger.exception("Error disconnecting MCP client")
+
+    # Synchronous Azure call wrapper (keeps same API you had)
+    def _call_azure_openai(self, messages: list, temperature: float = 0.2, max_tokens: int = 2048) -> str:
+        try:
+            completion = client_azure.chat.completions.create(
+                model=AZURE_OPENAI_DEPLOYMENT,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+            return completion.choices[0].message.content
+        except Exception as e:
+            logger.error(f"Azure OpenAI error: {e}")
+            return json.dumps({"error": str(e)})
+
+    async def list_tools(self):
+        if not self.session:
+            await self.connect()
+        tools_list = await self.session.list_tools()
+        return tools_list
+
+    async def invoke_tool(self, tool_name: str, args: dict):
+        if not self.session:
+            await self.connect()
+        logger.info(f"Invoking tool {tool_name} with args {args}")
+        result = await self.session.call_tool(tool_name, args)
+        # Try to extract useful content defensively
+        try:
+            if hasattr(result, "data"):
+                return result.data
+            if hasattr(result, "content"):
+                return result.content
+            return result
+        except Exception:
+            return result
+
+    # --- New: run_query with on_event callback for streaming ---
+    async def run_query(self, user_query: str, on_event: Callable[[str, dict], Any] = None):
+        """
+        Plans tools (synchronously via Azure), executes them via MCP (await), and calls on_event(event_name, payload)
+        at interesting moments so the caller (FastAPI) can stream SSE.
+        """
+        run_id = f"run-{uuid4().hex[:8]}"
+        if on_event:
+            await _maybe_call(on_event, "RUN_STARTED", {"run_id": run_id})
+
+        # 1) Planning (LLM synchronous call)
+        if on_event:
+            await _maybe_call(on_event, "THINKING", {"run_id": run_id, "stage": "planning"})
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT_PLAN},
+            {"role": "user", "content": user_query}
+        ]
+        plan_raw = self._call_azure_openai(messages, temperature=0.1)
+        # Try to parse JSON plan (defensive)
+        plan = []
+        try:
+            cleaned = plan_raw.strip().strip("`")
+            if cleaned.lower().startswith("json"):
+                cleaned = cleaned[4:].strip()
+            plan_obj = json.loads(cleaned)
+            plan = plan_obj.get("plan", []) if isinstance(plan_obj, dict) else (plan_obj if isinstance(plan_obj, list) else [])
+        except Exception:
+            logger.warning("LLM plan parse failed, sending raw as text plan")
+            # fallback: ask LLM for a single tool suggestion (not ideal)
+            plan = []
+
+        # notify plan readiness
+        if on_event:
+            await _maybe_call(on_event, "STATE_DELTA", {"run_id": run_id, "stage": "plan_ready", "plan_length": len(plan)})
+
+        results = []
+        # Execute plan sequentially (stream tool events)
+        for idx, step in enumerate(plan):
+            tool = step.get("tool")
+            args = step.get("arguments", {})
+            if on_event:
+                await _maybe_call(on_event, "TOOL_CALL_START", {"run_id": run_id, "tool": tool, "step": idx})
+                await _maybe_call(on_event, "TOOL_CALL_ARGS", {"run_id": run_id, "tool": tool, "args": args})
+            try:
+                resp = await self.invoke_tool(tool, args)
+                results.append({tool: resp})
+                if on_event:
+                    await _maybe_call(on_event, "TOOL_CALL_RESULT", {"run_id": run_id, "tool": tool, "result": resp})
+            except Exception as e:
+                logger.exception("Tool invocation failed")
+                if on_event:
+                    await _maybe_call(on_event, "RUN_ERROR", {"run_id": run_id, "error": str(e)})
+                results.append({tool: {"error": str(e)}})
+
+            # progress update
+            if on_event:
+                await _maybe_call(on_event, "STATE_DELTA", {"run_id": run_id, "progress": int((idx+1)/max(1,len(plan))*100)})
+
+        # Summarize results (LLM)
+        if on_event:
+            await _maybe_call(on_event, "THINKING", {"run_id": run_id, "stage": "summarizing"})
+        try:
+            summary = self.summarize_results(user_query, plan, results).get("summary", "")
+        except Exception:
+            summary = "Summary generation failed."
+
+        # stream summary in chunks
+        if on_event:
+            await _maybe_call(on_event, "TEXT_MESSAGE_START", {"run_id": run_id, "message_id": "msg1"})
+            for chunk in chunk_text(summary, size=120):
+                await _maybe_call(on_event, "TEXT_MESSAGE_CONTENT", {"run_id": run_id, "delta": chunk})
+                await asyncio.sleep(0.02)
+            await _maybe_call(on_event, "TEXT_MESSAGE_END", {"run_id": run_id, "message_id": "msg1"})
+
+        if on_event:
+            await _maybe_call(on_event, "RUN_FINISHED", {"run_id": run_id})
+
+        return {"run_id": run_id, "plan": plan, "results": results, "summary": summary}
+
+    # Summarizer uses Azure (same as your earlier method)
+    def summarize_results(self, user_query: str, plan: list, results: list) -> dict:
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT_SUMMARIZE},
+            {"role": "user", "content": f"Question:\n{user_query}"},
+            {"role": "assistant", "content": f"Plan:\n{json.dumps(plan, indent=2)}"},
+            {"role": "assistant", "content": f"Results:\n{json.dumps(results, indent=2)}"},
+        ]
+        summary = self._call_azure_openai(messages, temperature=0.3)
+        return {"summary": summary}
+
+# helper to call event (supports sync/async callbacks)
+async def _maybe_call(cb, name, payload):
+    try:
+        res = cb(name, payload)
+        if asyncio.iscoroutine(res):
+            await res
+    except Exception as e:
+        logger.exception("on_event callback failed")
+########################################################################
+# backend/mcp_server.py
+import os
+import logging
+import json
+from typing import Optional, Any, Dict
+from datetime import datetime
+from motor.motor_asyncio import AsyncIOMotorClient
+from dotenv import load_dotenv
+load_dotenv()
+
+from mcp.server.fastmcp import FastMCP
+
+HOST = os.getenv("MCP_HOST", "127.0.0.1")
+PORT = int(os.getenv("MCP_PORT", "8000"))
+TRANSPORT = os.getenv("MCP_TRANSPORT", "streamable-http")
+
+MONGODB_URL = os.getenv("MONGO_URI")
+DATABASE_NAME = os.getenv("MONGO_DB")
+COLLECTION_NAME = os.getenv("MONGO_COLLECTION")
+
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+logger = logging.getLogger("flightops.mcp.server")
+
+mcp = FastMCP("FlightOps MCP Server")
+
+# (All helper functions and tool implementations — paste your full server code here)
+# For brevity, reuse exactly your server.py content (the full tools) — I assume you already have them.
+
+if __name__ == "__main__":
+    logger.info("Starting FlightOps MCP Server on %s:%s (transport=%s)", HOST, PORT, TRANSPORT)
+    logger.info("MongoDB URL: %s, Database: %s, Collection: %s", MONGODB_URL, DATABASE_NAME, COLLECTION_NAME)
+    mcp.run(host=HOST, port=PORT, transport=TRANSPORT)
+# backend/mcp_server.py
+import os
+import logging
+import json
+from typing import Optional, Any, Dict
+from datetime import datetime
+from motor.motor_asyncio import AsyncIOMotorClient
+from dotenv import load_dotenv
+load_dotenv()
+
+from mcp.server.fastmcp import FastMCP
+
+HOST = os.getenv("MCP_HOST", "127.0.0.1")
+PORT = int(os.getenv("MCP_PORT", "8000"))
+TRANSPORT = os.getenv("MCP_TRANSPORT", "streamable-http")
+
+MONGODB_URL = os.getenv("MONGO_URI")
+DATABASE_NAME = os.getenv("MONGO_DB")
+COLLECTION_NAME = os.getenv("MONGO_COLLECTION")
+
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+logger = logging.getLogger("flightops.mcp.server")
+
+mcp = FastMCP("FlightOps MCP Server")
+
+# (All helper functions and tool implementations — paste your full server code here)
+# For brevity, reuse exactly your server.py content (the full tools) — I assume you already have them.
+
+if __name__ == "__main__":
+    logger.info("Starting FlightOps MCP Server on %s:%s (transport=%s)", HOST, PORT, TRANSPORT)
+    logger.info("MongoDB URL: %s, Database: %s, Collection: %s", MONGODB_URL, DATABASE_NAME, COLLECTION_NAME)
+    mcp.run(host=HOST, port=PORT, transport=TRANSPORT)
+###################################################################################################################
+# backend/fastapi_agui_server.py
+import asyncio
+import json
+import os
+import traceback
+from fastapi import FastAPI, Body
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse, JSONResponse
+from dotenv import load_dotenv
+
+from flightops_mcp_client import FlightOpsMCPClient
+
+load_dotenv()
+app = FastAPI()
+
+FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "http://localhost:5173")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[FRONTEND_ORIGIN],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+client_singleton = None
+
+def sse_event(event_name: str, payload: dict) -> str:
+    payload_json = json.dumps(payload, default=str, ensure_ascii=False)
+    return f"event: {event_name}\ndata: {payload_json}\n\n"
+
+@app.post("/get_data")
+async def get_data(userprompt: str = Body(..., embed=True)):
+    """
+    Accepts JSON body: { "userprompt": "..." }
+    Streams SSE events back to client.
+    """
+    global client_singleton
+    if client_singleton is None:
+        client_singleton = FlightOpsMCPClient()
+
+    async def event_gen():
+        # queue to receive events from client callback
+        q = asyncio.Queue()
+
+        # on_event callback that puts items into queue
+        def on_event(name, payload):
+            # ensure JSON-serializable payload
+            try:
+                asyncio.get_event_loop().call_soon_threadsafe(q.put_nowait, (name, payload))
+            except Exception:
+                # fallback synchronous
+                q.put_nowait((name, payload))
+
+        # Run the query in background task
+        task = asyncio.create_task(client_singleton.run_query(userprompt, on_event=on_event))
+
+        try:
+            while True:
+                try:
+                    name, payload = await asyncio.wait_for(q.get(), timeout=0.5)
+                    yield sse_event(name, payload)
+                except asyncio.TimeoutError:
+                    # if background finished and queue empty -> stop
+                    if task.done():
+                        # drain remaining
+                        while not q.empty():
+                            name, payload = q.get_nowait()
+                            yield sse_event(name, payload)
+                        break
+        except asyncio.CancelledError:
+            # If client disconnects, cancel background task
+            if not task.done():
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+            raise
+        except Exception as e:
+            yield sse_event("RUN_ERROR", {"error": str(e)})
+        finally:
+            # ensure task complete
+            if not task.done():
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+
+    return StreamingResponse(event_gen(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
+
+@app.post("/agent-action")
+async def agent_action(body: dict = Body(...)):
+    """
+    Frontend posts user actions like confirmations:
+    { "run_id": "...", "action": "yes", "payload": {...} }
+    For now we simply acknowledge — hooking into live run requires run-manager.
+    """
+    # TODO: implement run-state manager mapping run_id -> task/queue to forward action
+    return JSONResponse({"ok": True, "message": "action received", "body": body})
+
+@app.get("/health")
+async def health():
+    return {"status": "ok", "message": "AG-UI FastAPI running"}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("fastapi_agui_server:app", host="127.0.0.1", port=8001, reload=True)
+#################################################################################
+# MCP server
+MCP_SERVER_URL=http://127.0.0.1:8000
+
+# Azure OpenAI
+AZURE_OPENAI_KEY=sk-...
+AZURE_OPENAI_ENDPOINT=https://your-azure-resource.openai.azure.com/
+AZURE_OPENAI_DEPLOYMENT=gpt-4o
+AZURE_API_VERSION=2024-12-01-preview
+
+# FastAPI CORS
+FRONTEND_ORIGIN=http://localhost:5173
+
+# Mongo (for MCP server)
+MONGO_URI=mongodb://localhost:27017
+MONGO_DB=flightops
+MONGO_COLLECTION=flights
+##################################################################
+import React from "react";
+import { createRoot } from "react-dom/client";
+import App from "./App";
+import "./styles.css";
+
+createRoot(document.getElementById("root")).render(<App />);
+####################################################################
+// paste the App.jsx content from the earlier message (I repeat here for convenience)
+import React, { useState, useRef } from "react";
+import { parseSSEChunks } from "./sseHelpers";
+
+const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || "http://127.0.0.1:8001/get_data";
+
+export default function App() {
+  const [query, setQuery] = useState("");
+  const [transcript, setTranscript] = useState("");
+  const [isThinking, setIsThinking] = useState(false);
+  const [progress, setProgress] = useState(null);
+  const [toolLogs, setToolLogs] = useState([]);
+  const [runId, setRunId] = useState(null);
+  const [showConfirm, setShowConfirm] = useState(null);
+  const controllerRef = useRef(null);
+
+  function appendTranscriptText(text) {
+    setTranscript(prev => prev + text);
+  }
+
+  function pushToolLog(log) {
+    setToolLogs(prev => [log, ...prev].slice(0, 200));
+  }
+
+  function handleCustomEvent(payload) {
+    if (payload.type === "confirm_action") {
+      setShowConfirm({ message: payload.message, options: payload.options || ["yes","no"], payload });
+    } else {
+      pushToolLog({ type: "custom", content: JSON.stringify(payload) });
+    }
+  }
+
+  async function startRun() {
+    if (!query.trim()) return;
+    setTranscript("");
+    setToolLogs([]);
+    setProgress(null);
+    setIsThinking(true);
+    setRunId(null);
+    setShowConfirm(null);
+
+    if (controllerRef.current) {
+      controllerRef.current.abort();
+      controllerRef.current = null;
+    }
+    const controller = new AbortController();
+    controllerRef.current = controller;
+
+    try {
+      const res = await fetch(BACKEND_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ userprompt: query }),
+        signal: controller.signal,
+      });
+
+      if (!res.ok) {
+        const text = await res.text();
+        pushToolLog({ type: "error", content: `HTTP ${res.status}: ${text}` });
+        setIsThinking(false);
+        return;
+      }
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder("utf-8");
+      let buffer = "";
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const [chunks, rest] = parseSSEChunks(buffer);
+        buffer = rest;
+        for (const chunk of chunks) {
+          const { event, data } = chunk;
+          handleEvent(event, data);
+        }
+      }
+    } catch (err) {
+      if (err.name === "AbortError") {
+        pushToolLog({ type: "info", content: "Stream aborted by user." });
+      } else {
+        pushToolLog({ type: "error", content: `Stream error: ${err.message}` });
+      }
+    } finally {
+      setIsThinking(false);
+      controllerRef.current = null;
+    }
+  }
+
+  function handleEvent(eventName, payload) {
+    const p = (payload && payload.payload) ? payload.payload : payload;
+
+    switch (eventName) {
+      case "RUN_STARTED":
+        setRunId(p.run_id || p.runId || null);
+        pushToolLog({ type: "lifecycle", content: `Run started: ${p.run_id || p.runId || ""}` });
+        break;
+      case "THINKING":
+        setIsThinking(true);
+        pushToolLog({ type: "thinking", content: p.note || p.stage || JSON.stringify(p) });
+        break;
+      case "STATE_DELTA":
+        if (p.progress !== undefined) setProgress(Math.round(p.progress));
+        pushToolLog({ type: "state", content: JSON.stringify(p) });
+        break;
+      case "TOOL_CALL_START":
+        pushToolLog({ type: "tool-start", tool: p.tool, content: JSON.stringify(p) });
+        break;
+      case "TOOL_CALL_ARGS":
+        pushToolLog({ type: "tool-args", tool: p.tool, content: JSON.stringify(p) });
+        break;
+      case "TOOL_CALL_RESULT":
+        pushToolLog({ type: "tool-result", tool: p.tool, content: (p.result || p.content || JSON.stringify(p)).toString() });
+        break;
+      case "TEXT_MESSAGE_CONTENT":
+        if (p.delta) appendTranscriptText(p.delta);
+        else appendTranscriptText(JSON.stringify(p));
+        break;
+      case "TEXT_MESSAGE_START":
+        pushToolLog({ type: "text-start", content: `Assistant started replying` });
+        break;
+      case "TEXT_MESSAGE_END":
+        pushToolLog({ type: "text-end", content: "Assistant finished message" });
+        break;
+      case "RUN_FINISHED":
+        pushToolLog({ type: "lifecycle", content: "Run finished" });
+        setIsThinking(false);
+        break;
+      case "RUN_ERROR":
+        pushToolLog({ type: "error", content: p.error || JSON.stringify(p) });
+        setIsThinking(false);
+        break;
+      case "CUSTOM_EVENT":
+        handleCustomEvent(p);
+        break;
+      default:
+        pushToolLog({ type: "unknown", content: `${eventName} ${JSON.stringify(p)}` });
+    }
+  }
+
+  function cancelRun() {
+    if (controllerRef.current) controllerRef.current.abort();
+  }
+
+  return (
+    <div className="app">
+      <header>
+        <h1>FlightOps Assistant — Indigo (Deeksha)</h1>
+      </header>
+
+      <main>
+        <section className="controls">
+          <textarea value={query} onChange={e=>setQuery(e.target.value)} placeholder="Type flight query, e.g. '6E 215 status today'"></textarea>
+          <div className="buttons">
+            <button onClick={startRun} disabled={isThinking}>Ask</button>
+            <button onClick={cancelRun} disabled={!isThinking}>Cancel</button>
+          </div>
+        </section>
+
+        <section className="stream">
+          <div className="meta">
+            {isThinking ? <span className="badge thinking">Thinking…</span> : <span className="badge idle">Idle</span>}
+            {progress !== null && <span className="badge">Progress: {progress}%</span>}
+            {runId && <span className="badge">run: {runId}</span>}
+          </div>
+
+          <div className="transcript">
+            <h3>Assistant</h3>
+            <div className="streaming-text">{transcript || <i>Waiting for response…</i>}</div>
+          </div>
+
+          <div className="tool-logs">
+            <h4>Events / Tool logs</h4>
+            <ul>
+              {toolLogs.map((t, idx) => (
+                <li key={idx} className={`log ${t.type}`}>
+                  <strong>{t.type}</strong> {t.tool ? `(${t.tool})` : ""} — {t.content}
+                </li>
+              ))}
+            </ul>
+          </div>
+        </section>
+      </main>
+
+      {showConfirm && (
+        <div className="modal">
+          <div className="modal-body">
+            <p>{showConfirm.message}</p>
+            <div className="modal-actions">
+              {showConfirm.options.map(opt => (
+                <button key={opt} onClick={()=>{
+                  fetch("/agent-action", { method: "POST", headers:{ "Content-Type":"application/json" }, body: JSON.stringify({ run_id: runId, action: opt, payload: showConfirm.payload })});
+                  setShowConfirm(null);
+                }}>{opt}</button>
+              ))}
+              <button onClick={()=>setShowConfirm(null)}>Dismiss</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      <footer>
+        <small>FlightOps Assistant — frontend demo</small>
+      </footer>
+    </div>
+  );
+}
+###################################################################
+export function parseSSEChunks(buffer) {
+  const parts = buffer.split("\n\n");
+  const remainder = parts.pop();
+  const events = [];
+  for (const part of parts) {
+    if (!part.trim()) continue;
+    const lines = part.split("\n").map(l => l.trim()).filter(Boolean);
+    let event = "message";
+    let data = null;
+    for (const line of lines) {
+      if (line.startsWith("event:")) event = line.replace("event:", "").trim();
+      else if (line.startsWith("data:")) {
+        const d = line.replace("data:", "").trim();
+        try {
+          data = JSON.parse(d);
+        } catch (e) {
+          data = d;
+        }
+      }
+    }
+    events.push({ event, data });
+  }
+  return [events, remainder];
+}
+##################################################
+body{ font-family: Inter, Arial, sans-serif; margin:0; padding:16px; background:#f6f7fb; color:#111 }
+.app header h1{ margin:0 0 12px; font-size:20px }
+.controls textarea{ width:100%; height:80px; padding:8px; font-size:14px }
+.buttons{ margin-top:8px }
+button{ padding:8px 12px; margin-right:8px; cursor:pointer }
+.stream{ display:flex; gap:16px; margin-top:12px }
+.transcript{ flex:2; background:white; padding:12px; border-radius:8px; min-height:140px }
+.tool-logs{ flex:1; max-height:300px; overflow:auto; background:#fff; padding:12px; border-radius:8px }
+.log{ font-size:13px; margin-bottom:6px }
+.badge{ display:inline-block; background:#eef; padding:6px 8px; border-radius:6px; margin-right:8px }
+.badge.thinking{ background:#fff3cd }
+.modal{ position:fixed; inset:0; display:flex; align-items:center; justify-content:center; background:rgba(0,0,0,0.4) }
+.modal-body{ background:#fff; padding:16px; border-radius:8px; width:320px }
+.modal-actions button{ margin-right:8px }
