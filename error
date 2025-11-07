@@ -47,3 +47,10 @@ InputFields       : {}
 Links             : {}
 ParsedHtml        : mshtml.HTMLDocumentClass
 RawContentLength  : 2
+#####################################################
+# prepare JSON body
+$body = @{ userprompt = "6E 215 status today" } | ConvertTo-Json
+
+# POST to backend (fastapi_agui_server)
+Invoke-WebRequest -Uri "http://127.0.0.1:8001/get_data" -Method Post -Body $body -ContentType "application/json"
+
