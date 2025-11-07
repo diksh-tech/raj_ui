@@ -6,3 +6,13 @@ http://127.0.0.1:8001/health
   "status": "ok",
   "message": "AG-UI FastAPI running"
 }
+##################################################
+Invoke-WebRequest -Uri "http://127.0.0.1:8001/get_data?userprompt=6E%20215%20status%20today" -Method Post
+#######################################################33
+$headers = @{
+  "Origin" = "http://localhost:5173"
+  "Access-Control-Request-Method" = "POST"
+  "Access-Control-Request-Headers" = "content-type"
+}
+
+Invoke-WebRequest -Uri "http://127.0.0.1:8001/get_data" -Method Options -Headers $headers
