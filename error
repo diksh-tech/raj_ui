@@ -53,4 +53,37 @@ $body = @{ userprompt = "6E 215 status today" } | ConvertTo-Json
 
 # POST to backend (fastapi_agui_server)
 Invoke-WebRequest -Uri "http://127.0.0.1:8001/get_data" -Method Post -Body $body -ContentType "application/json"
+(agui) PS C:\Users\Deeksha.x.Srivastava\OneDrive - InterGlobe Aviation Limited\Desktop\new_mcp_ui> # prepare JSON body           >> $body = @{ userprompt = "6E 215 status today" } | ConvertTo-Json                                                              >>                                                                                                                               
+>> # POST to backend (fastapi_agui_server)
+>> Invoke-WebRequest -Uri "http://127.0.0.1:8001/get_data" -Method Post -Body $body -ContentType "application/json"
+
+
+StatusCode        : 200
+StatusDescription : OK
+Content           : event: RUN_STARTED
+                    data: {"run_id": "run-a17ad766"}
+
+                    event: THINKING
+                    data: {"run_id": "run-a17ad766", "stage": "planning"}
+
+                    event: STATE_DELTA
+                    data: {"run_id": "run-a17ad766", "stage": "plan_ready", "...
+RawContent        : HTTP/1.1 200 OK
+                    connection: keep-alive
+                    Transfer-Encoding: chunked
+                    Cache-Control: no-cache
+                    Content-Type: text/event-stream; charset=utf-8
+                    Date: Fri, 07 Nov 2025 15:48:32 GMT
+                    Server: uvicorn
+
+                    ev...
+Forms             : {}
+Headers           : {[connection, keep-alive], [Transfer-Encoding, chunked], [Cache-Control, no-cache], [Content-Type,
+                    text/event-stream; charset=utf-8]...}
+Images            : {}
+InputFields       : {}
+Links             : {}
+ParsedHtml        : mshtml.HTMLDocumentClass
+RawContentLength  : 846
+
 
