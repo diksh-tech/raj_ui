@@ -1333,4 +1333,271 @@ button {
 .modal-actions button {
   margin-right: 8px;
 }
+################################################################3
+// src/App.jsx
+import React, { useState, useRef } from "react";
+import { parseSSEChunks } from "./sseHelpers";
+import "./styles.css";
+
+const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || "http://127.0.0.1:8001/get_data";
+const AGENT_ACTION_URL = (import.meta.env.VITE_BACKEND_ROOT || "http://127.0.0.1:8001") + "/agent-action";
+
+export default function App() {
+  const [query, setQuery] = useState("");
+  const [transcript, setTranscript] = useState("");
+  const [isThinking, setIsThinking] = useState(false);
+  const [progress, setProgress] = useState(null);
+  const [toolLogs, setToolLogs] = useState([]);
+  const [runId, setRunId] = useState(null);
+  const [showConfirm, setShowConfirm] = useState(null);
+  const controllerRef = useRef(null);
+
+  function appendTranscriptText(text) {
+    setTranscript(prev => prev + text);
+  }
+
+  function pushToolLog(log) {
+    setToolLogs(prev => [log, ...prev].slice(0, 200));
+  }
+
+  function handleCustomEvent(payload) {
+    // AG-UI custom event example: confirm_action
+    if (!payload) return;
+    if (payload.type === "confirm_action" || payload.payload?.type === "confirm_action") {
+      const p = payload.payload ? payload.payload : payload;
+      setShowConfirm({ message: p.message || "Confirm?", options: p.options || ["yes", "no"], payload: p });
+    } else {
+      pushToolLog({ type: "custom", content: JSON.stringify(payload) });
+    }
+  }
+
+  async function startRun() {
+    if (!query.trim()) return;
+    // reset UI state
+    setTranscript("");
+    setToolLogs([]);
+    setProgress(null);
+    setIsThinking(true);
+    setRunId(null);
+    setShowConfirm(null);
+
+    // abort previous if running
+    if (controllerRef.current) {
+      controllerRef.current.abort();
+      controllerRef.current = null;
+    }
+    const controller = new AbortController();
+    controllerRef.current = controller;
+
+    try {
+      const res = await fetch(BACKEND_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ userprompt: query }),
+        signal: controller.signal,
+      });
+
+      if (!res.ok) {
+        const text = await res.text();
+        pushToolLog({ type: "error", content: `HTTP ${res.status}: ${text}` });
+        setIsThinking(false);
+        return;
+      }
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder("utf-8");
+      let buffer = "";
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const [chunks, rest] = parseSSEChunks(buffer);
+        buffer = rest;
+        for (const chunk of chunks) {
+          const { event, data } = chunk;
+          handleEvent(event, data);
+        }
+      }
+    } catch (err) {
+      if (err.name === "AbortError") {
+        pushToolLog({ type: "info", content: "Stream aborted by user." });
+      } else {
+        pushToolLog({ type: "error", content: `Stream error: ${err?.message || String(err)}` });
+      }
+    } finally {
+      setIsThinking(false);
+      controllerRef.current = null;
+    }
+  }
+
+  function handleEvent(eventName, payload) {
+    // payload might be { run_id:..., payload: {...} } or raw object
+    const p = (payload && payload.payload) ? payload.payload : payload;
+
+    switch (eventName) {
+      case "RUN_STARTED":
+      case "RunStartedEvent":
+        setRunId(p.run_id || p.runId || p.run || null);
+        pushToolLog({ type: "lifecycle", content: `Run started: ${p.run_id || p.runId || ""}` });
+        break;
+
+      case "THINKING":
+      case "THINKING_EVENT":
+      case "thinking":
+        setIsThinking(true);
+        pushToolLog({ type: "thinking", content: p.note || p.stage || JSON.stringify(p) });
+        break;
+
+      case "STATE_DELTA":
+      case "state_delta":
+        if (p && typeof p.progress === "number") setProgress(Math.round(p.progress));
+        pushToolLog({ type: "state", content: JSON.stringify(p) });
+        break;
+
+      case "TOOL_CALL_START":
+      case "ToolCallStartEvent":
+        pushToolLog({ type: "tool-start", tool: p.tool || p.tool_call_name, content: JSON.stringify(p) });
+        break;
+
+      case "TOOL_CALL_ARGS":
+      case "ToolCallArgsEvent":
+        pushToolLog({ type: "tool-args", tool: p.tool, content: JSON.stringify(p.args || p) });
+        break;
+
+      case "TOOL_CALL_RESULT":
+      case "ToolCallResultEvent":
+        pushToolLog({ type: "tool-result", tool: p.tool, content: (p.result || p.content || JSON.stringify(p)).toString() });
+        break;
+
+      case "TEXT_MESSAGE_START":
+      case "TextMessageStartEvent":
+        pushToolLog({ type: "text-start", content: `Assistant started replying` });
+        break;
+
+      case "TEXT_MESSAGE_CONTENT":
+      case "TextMessageContentEvent":
+        // streaming text delta
+        if (p && p.delta) appendTranscriptText(p.delta);
+        else if (typeof p === "string") appendTranscriptText(p);
+        else appendTranscriptText(JSON.stringify(p));
+        break;
+
+      case "TEXT_MESSAGE_END":
+      case "TextMessageEndEvent":
+        pushToolLog({ type: "text-end", content: "Assistant finished message" });
+        break;
+
+      case "RUN_FINISHED":
+      case "RunFinishedEvent":
+        pushToolLog({ type: "lifecycle", content: "Run finished" });
+        setIsThinking(false);
+        break;
+
+      case "RUN_ERROR":
+      case "RunErrorEvent":
+        pushToolLog({ type: "error", content: p.error || p.message || JSON.stringify(p) });
+        setIsThinking(false);
+        break;
+
+      case "CUSTOM_EVENT":
+      case "CustomEvent":
+        handleCustomEvent(p);
+        break;
+
+      default:
+        // fallback: log unknown events
+        pushToolLog({ type: "unknown", content: `${eventName} ${JSON.stringify(p)}` });
+    }
+  }
+
+  async function sendAgentAction(action) {
+    if (!runId) {
+      pushToolLog({ type: "error", content: "No active run_id to send action to." });
+      return;
+    }
+    try {
+      const body = { run_id: runId, action, payload: showConfirm?.payload || null };
+      const resp = await fetch(AGENT_ACTION_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const j = await resp.json();
+      pushToolLog({ type: "action-sent", content: JSON.stringify(j) });
+    } catch (e) {
+      pushToolLog({ type: "error", content: `Failed to send action: ${e.message || String(e)}` });
+    } finally {
+      setShowConfirm(null);
+    }
+  }
+
+  function cancelRun() {
+    if (controllerRef.current) controllerRef.current.abort();
+  }
+
+  return (
+    <div className="app">
+      <header>
+        <h1>FlightOps Assistant — Indigo (Deeksha)</h1>
+      </header>
+
+      <main>
+        <section className="controls">
+          <textarea
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder="Type flight query, e.g. '6E 215 status today'; then press Ask"
+          />
+          <div className="buttons">
+            <button onClick={startRun} disabled={isThinking}>Ask</button>
+            <button onClick={cancelRun} disabled={!isThinking}>Cancel</button>
+          </div>
+        </section>
+
+        <section className="stream">
+          <div className="meta">
+            {isThinking ? <span className="badge thinking">Thinking…</span> : <span className="badge idle">Idle</span>}
+            {progress !== null && <span className="badge">Progress: {progress}%</span>}
+            {runId && <span className="badge">run: {runId}</span>}
+          </div>
+
+          <div className="transcript">
+            <h3>Assistant</h3>
+            <div className="streaming-text">{transcript || <i>Waiting for response…</i>}</div>
+          </div>
+
+          <div className="tool-logs">
+            <h4>Events / Tool logs</h4>
+            <ul>
+              {toolLogs.map((t, idx) => (
+                <li key={idx} className={`log ${t.type}`}>
+                  <strong>{t.type}</strong> {t.tool ? `(${t.tool})` : ""} — {t.content}
+                </li>
+              ))}
+            </ul>
+          </div>
+        </section>
+      </main>
+
+      {showConfirm && (
+        <div className="modal">
+          <div className="modal-body">
+            <p>{showConfirm.message}</p>
+            <div className="modal-actions">
+              {showConfirm.options.map((opt) => (
+                <button key={opt} onClick={() => sendAgentAction(opt)}>{opt}</button>
+              ))}
+              <button onClick={() => setShowConfirm(null)}>Dismiss</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      <footer>
+        <small>FlightOps Assistant — frontend demo</small>
+      </footer>
+    </div>
+  );
+}
 
