@@ -1677,4 +1677,54 @@ async function startRun() {
     controllerRef.current = null;
   }
 }
+#####################################################################################
+(agui) PS C:\Users\Deeksha.x.Srivastava\OneDrive - InterGlobe Aviation Limited\Desktop\new_mcp_ui\backend> python .\fastapi_agui_server.py
+INFO:     Will watch for changes in these directories: ['C:\\Users\\Deeksha.x.Srivastava\\OneDrive - InterGlobe Aviation Limited\\Desktop\\new_mcp_ui\\backend']
+INFO:     Uvicorn running on http://127.0.0.1:8001 (Press CTRL+C to quit)
+INFO:     Started reloader process [25800] using StatReload
+INFO:     Started server process [20080]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     127.0.0.1:53301 - "GET / HTTP/1.1" 404 Not Found
+INFO:     127.0.0.1:53301 - "GET /favicon.ico HTTP/1.1" 404 Not Found
+INFO:     127.0.0.1:57972 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:59410 - "POST /get_data?userprompt=6E%20215%20status%20today HTTP/1.1" 422 Unprocessable Content
+INFO:     127.0.0.1:61493 - "OPTIONS /get_data HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51416 - "POST /get_data HTTP/1.1" 200 OK
+INFO:httpx:HTTP Request: POST https://6e-openai-sandbox-aops.openai.azure.com/openai/deployments/gpt-4o/chat/completions?api-versINFO:     127.0.0.1:59410 - "POST /get_data?userprompt=6E%20215%20status%20today HTTP/1.1" 422 Unprocessable Content
+INFO:     127.0.0.1:61493 - "OPTIONS /get_data HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51416 - "POST /get_data HTTP/1.1" 200 OK
+INFO:httpx:HTTP Request: POST https://6e-openai-sandbox-aops.openai.azure.com/openai/deployments/gpt-4o/chat/completions?api-version=2024-12-01-preview "HTTP/1.1 200 OK"
+WARNING:FlightOps.MCPClient:LLM plan parse failed, sending raw as text plan
+INFO:httpx:HTTP Request: POST https://6e-openai-sandbox-aops.openai.azure.com/openai/deployments/gpt-4o/chat/completions?api-version=2024-12-01-preview "HTTP/1.1 200 OK"
 
+
+
+
+
+
+INFO:     127.0.0.1:59410 - "POST /get_data?userprompt=6E%20215%20status%20today HTTP/1.1" 422 Unprocessable Content
+INFO:     127.0.0.1:61493 - "OPTIONS /get_data HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51416 - "POST /get_data HTTP/1.1" 200 OK
+INFO:httpx:HTTP Request: POST https://6e-openai-sandbox-aops.openai.azure.com/openai/deployments/gpt-4o/chat/completions?api-version=2024-12-01-preview "HTTP/1.1 200 OK"
+WARNING:FlightOps.MCPClient:LLM plan parse failed, sending raw as text plan
+INFO:httpx:HTTP Request: POST https://6e-openai-sandbox-aops.openai.azure.com/openai/deployments/gpt-4o/chat/completions?api-version=2024-12-01-preview "HTTP/1.1 200 OK"
+
+
+INFO:     127.0.0.1:59410 - "POST /get_data?userprompt=6E%20215%20status%20today HTTP/1.1" 422 Unprocessable Content
+INFO:     127.0.0.1:61493 - "OPTIONS /get_data HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51416 - "POST /get_data HTTP/1.1" 200 OK
+INFO:httpx:HTTP Request: POST https://6e-openai-sandbox-aops.openai.azure.com/openai/deployments/gpt-4o/chat/completions?api-version=2024-12-01-preview "HTTP/1.1 200 OK"
+INFO:     127.0.0.1:61493 - "OPTIONS /get_data HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51416 - "POST /get_data HTTP/1.1" 200 OK
+INFO:httpx:HTTP Request: POST https://6e-openai-sandbox-aops.openai.azure.com/openai/deployments/gpt-4o/chat/completions?api-versINFO:     127.0.0.1:51416 - "POST /get_data HTTP/1.1" 200 OK
+INFO:httpx:HTTP Request: POST https://6e-openai-sandbox-aops.openai.azure.com/openai/deployments/gpt-4o/chat/completions?api-versINFO:httpx:HTTP Request: POST https://6e-openai-sandbox-aops.openai.azure.com/openai/deployments/gpt-4o/chat/completions?api-version=2024-12-01-preview "HTTP/1.1 200 OK"
+WARNING:FlightOps.MCPClient:LLM plan parse failed, sending raw as text plan
+INFO:httpx:HTTP Request: POST https://6e-openai-sandbox-aops.openai.azure.com/openai/deployments/gpt-4o/chat/completions?api-version=2024-12-01-preview "HTTP/1.1 200 OK"
+INFO:     127.0.0.1:56990 - "OPTIONS /get_data HTTP/1.1" 400 Bad Request
+INFO:     127.0.0.1:56990 - "OPTIONS /get_data HTTP/1.1" 400 Bad Request
+INFO:     127.0.0.1:53672 - "OPTIONS /get_data HTTP/1.1" 200 OK
+INFO:     127.0.0.1:53672 - "POST /get_data HTTP/1.1" 200 OK
+INFO:httpx:HTTP Request: POST https://6e-openai-sandbox-aops.openai.azure.com/openai/deployments/gpt-4o/chat/completions?api-version=2024-12-01-preview "HTTP/1.1 200 OK"
+WARNING:FlightOps.MCPClient:LLM plan parse failed, sending raw as text plan
+INFO:httpx:HTTP Request: POST https://6e-openai-sandbox-aops.openai.azure.com/openai/deployments/gpt-4o/chat/completions?api-version=2024-12-01-preview "HTTP/1.1 200 OK"
