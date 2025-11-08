@@ -1,0 +1,485 @@
+import json, uuid
+from datetime import datetime
+
+def ndjson(ev: dict) -> bytes:
+    return (json.dumps(ev, ensure_ascii=False) + "\n").encode("utf-8")
+
+def text_start(message_id: str, role="assistant"):
+    return {"type":"TEXT_MESSAGE_START","messageId":message_id,"role":role,"ts":datetime.utcnow().isoformat()+"Z"}
+
+def text_content(message_id: str, text: str):
+    # ensure it's always string
+    if not isinstance(text, str):
+        try:
+            text = text.get("summary", "")
+        except Exception:
+            import json as _json
+            text = _json.dumps(text, ensure_ascii=False)
+    return {"type":"TEXT_MESSAGE_CONTENT","messageId":message_id,"text":text}
+
+def text_end(message_id: str):
+    return {"type":"TEXT_MESSAGE_END","messageId":message_id}
+
+def tool_start(tool_call_id: str, name: str):
+    return {"type":"TOOL_CALL_START","toolCallId":tool_call_id,"name":name}
+
+def tool_args(tool_call_id: str, args: dict):
+    return {"type":"TOOL_CALL_ARGS","toolCallId":tool_call_id,"args":args}
+
+def tool_result(tool_call_id: str, result):
+    return {"type":"TOOL_CALL_RESULT","toolCallId":tool_call_id,"result":result}
+
+def tool_end(tool_call_id: str, ok=True):
+    return {"type":"TOOL_CALL_END","toolCallId":tool_call_id,"ok":ok}
+
+def state_delta(patch_ops: list):
+    return {"type":"STATE_DELTA","ops":patch_ops}
+
+def new_ids():
+    return str(uuid.uuid4()), str(uuid.uuid4())  # (message_id, tool_call_id)
+#######################################################################3
+import os, json, logging
+from dotenv import load_dotenv
+from openai import AzureOpenAI
+from mcp import ClientSession
+from mcp.client.streamable_http import streamablehttp_client
+
+from typing import Any, Dict, List
+from tool_registry import TOOLS
+
+load_dotenv()
+logger = logging.getLogger("FlightOps.MCPClient")
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+
+MCP_SERVER_URL = os.getenv("MCP_SERVER_URL", "http://127.0.0.1:8000").rstrip("/")
+
+AZURE_OPENAI_KEY = os.getenv("AZURE_OPENAI_KEY")
+AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
+AZURE_OPENAI_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
+AZURE_API_VERSION = os.getenv("AZURE_API_VERSION", "2024-12-01-preview")
+
+if not AZURE_OPENAI_KEY:
+    raise RuntimeError("❌ AZURE_OPENAI_KEY not set")
+
+client_azure = AzureOpenAI(
+    api_key=AZURE_OPENAI_KEY,
+    api_version=AZURE_API_VERSION,
+    azure_endpoint=AZURE_OPENAI_ENDPOINT
+)
+
+def _build_tool_prompt() -> str:
+    lines = []
+    for name, meta in TOOLS.items():
+        arg_str = ", ".join(meta["args"])
+        lines.append(f"- {name}({arg_str}): {meta['desc']}")
+    return "\n".join(lines)
+
+SYSTEM_PROMPT_PLAN = f"""
+You are an assistant that converts user questions into MCP tool calls.
+
+Available tools:
+{_build_tool_prompt()}
+
+Rules:
+- For counts/averages/sums/min/max → use run_aggregated_query with appropriate "field" and "query_type".
+- For listings/filtering → use raw_mongodb_query with "query_json", "projection", "limit".
+- For single-flight facts → use the specific flight tools (get_flight_basic_info, get_operation_times, get_equipment_info, get_delay_summary, get_fuel_summary, get_passenger_info, get_crew_info).
+- Always return valid JSON with a top-level "plan" array.
+- Never include "_id" in projections.
+"""
+
+SYSTEM_PROMPT_SUMMARIZE = """
+You summarize tool outputs into a crisp, user-facing answer.
+- Be factual and concise.
+- Bullet points or short paragraphs.
+"""
+
+class FlightOpsMCPClient:
+    def __init__(self, base_url: str = None):
+        self.base_url = (base_url or MCP_SERVER_URL).rstrip("/")
+        self.session: ClientSession | None = None
+        self._client_context = None
+
+    async def connect(self):
+        logger.info(f"Connecting to MCP server at {self.base_url}")
+        self._client_context = streamablehttp_client(self.base_url)
+        read_stream, write_stream, _ = await self._client_context.__aenter__()
+        self.session = ClientSession(read_stream, write_stream)
+        await self.session.__aenter__()
+        await self.session.initialize()
+        logger.info("✅ Connected to MCP server")
+
+    async def disconnect(self):
+        try:
+            if self.session:
+                await self.session.__aexit__(None, None, None)
+            if self._client_context:
+                await self._client_context.__aexit__(None, None, None)
+        except Exception as e:
+            logger.error(f"Disconnect error: {e}")
+
+    def _call_azure_openai(self, messages: list, temperature=0.2, max_tokens=1024) -> str:
+        try:
+            completion = client_azure.chat.completions.create(
+                model=AZURE_OPENAI_DEPLOYMENT,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+            return completion.choices[0].message.content
+        except Exception as e:
+            logger.error(f"Azure OpenAI error: {e}")
+            return ""
+
+    async def list_tools(self) -> dict:
+        if not self.session:
+            await self.connect()
+        tools_list = await self.session.list_tools()
+        tools_dict = {t.name: {"description": t.description, "inputSchema": t.inputSchema} for t in tools_list.tools}
+        return {"tools": tools_dict}
+
+    async def invoke_tool(self, tool_name: str, args: dict) -> dict:
+        if not self.session:
+            await self.connect()
+        logger.info(f"Calling tool {tool_name} args={args}")
+        result = await self.session.call_tool(tool_name, args)
+        if result.content:
+            items = []
+            for it in result.content:
+                if hasattr(it, "text"):
+                    try:
+                        items.append(json.loads(it.text))
+                    except json.JSONDecodeError:
+                        items.append(it.text)
+            return items[0] if len(items) == 1 else {"results": items}
+        return {"error": "No content"}
+
+    def plan_tools(self, user_query: str) -> dict:
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT_PLAN},
+            {"role": "user", "content": user_query},
+        ]
+        content = (self._call_azure_openai(messages, temperature=0.1) or "").strip()
+        if content.startswith("```"):
+            cleaned = content.strip("`")
+            if cleaned.lower().startswith("json"):
+                cleaned = cleaned[4:].strip()
+            cleaned = cleaned.replace("```", "").strip()
+        else:
+            cleaned = content
+        try:
+            plan = json.loads(cleaned)
+            return plan if isinstance(plan, dict) and "plan" in plan else {"plan": []}
+        except json.JSONDecodeError:
+            logger.warning(f"Plan parse failed. Raw:\n{content}")
+            return {"plan": []}
+
+    def summarize_results(self, user_query: str, plan: list, results: list) -> str:
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT_SUMMARIZE},
+            {"role": "user", "content": f"Question:\n{user_query}"},
+            {"role": "assistant", "content": f"Plan:\n{json.dumps(plan, indent=2)}"},
+            {"role": "assistant", "content": f"Results:\n{json.dumps(results, indent=2)}"},
+        ]
+        summary = self._call_azure_openai(messages, temperature=0.3)
+        return summary or ""
+##########################################################
+import json, logging
+from typing import AsyncGenerator
+
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+
+from agui import ndjson, text_start, text_content, text_end, tool_start, tool_args, tool_result, tool_end, state_delta, new_ids
+from client_runner import FlightOpsMCPClient
+
+logger = logging.getLogger("FlightOps.AGUI")
+logging.basicConfig(level="INFO")
+
+app = FastAPI()
+
+# CORS for Vite
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173","http://127.0.0.1:5173","*"],
+    allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
+)
+
+mcp_client = FlightOpsMCPClient()
+
+@app.on_event("startup")
+async def _startup():
+    try:
+        await mcp_client.connect()
+        logger.info("MCP client connected on startup")
+    except Exception as e:
+        logger.error(f"MCP connect failed: {e}")
+
+@app.post("/agui/chat")
+async def agui_chat(req: Request):
+    """
+    Body: { messages:[{role, content}...], state:{} }
+    Streams AG-UI NDJSON events.
+    """
+    body = await req.json()
+    messages = body.get("messages", [])
+    user_msg = messages[-1]["content"] if messages else ""
+    app_state = body.get("state", {})  # optional
+
+    async def stream() -> AsyncGenerator[bytes, None]:
+        msg_id, _ = new_ids()
+
+        # 1) start assistant message
+        yield ndjson(text_start(msg_id))
+
+        # 2) plan
+        plan_data = mcp_client.plan_tools(user_msg)
+        plan = plan_data.get("plan", [])
+        if plan:
+            yield ndjson(state_delta([{"op":"add","path":"/lastPlan","value":plan}]))
+
+        results = []
+
+        # 3) execute tools (sequential for simplicity)
+        for step in plan:
+            tool = step.get("tool")
+            args = (step.get("arguments") or {})
+            args = {k: v for k, v in args.items() if v not in (None, "", "unknown")}
+
+            tool_id = msg_id  # or separate per-call id
+            yield ndjson(tool_start(tool_id, tool))
+            yield ndjson(tool_args(tool_id, args))
+            try:
+                resp = await mcp_client.invoke_tool(tool, args)
+                results.append({tool: resp})
+                yield ndjson(tool_result(tool_id, resp))
+                yield ndjson(tool_end(tool_id, True))
+            except Exception as e:
+                err = {"error": str(e)}
+                results.append({tool: err})
+                yield ndjson(tool_result(tool_id, err))
+                yield ndjson(tool_end(tool_id, False))
+
+        # 4) summarize (ensure STRING)
+        summary = mcp_client.summarize_results(user_msg, plan, results) if plan else "No tool plan generated."
+        if not isinstance(summary, str):
+            try:
+                summary = summary.get("summary", "")
+            except Exception:
+                summary = json.dumps(summary)
+
+        # chunk in case of long text
+        CHUNK = 800
+        for i in range(0, len(summary), CHUNK):
+            yield ndjson(text_content(msg_id, summary[i:i+CHUNK]))
+
+        # 5) end
+        yield ndjson(text_end(msg_id))
+
+    return StreamingResponse(stream(), media_type="application/x-ndjson")
+#########################################################
+{
+  "name": "flightops-agui-frontend",
+  "private": true,
+  "version": "0.0.1",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview --port 5173"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.3.1",
+    "vite": "^5.4.0"
+  }
+}
+#######################################################
+import { defineConfig } from "vite";
+import react from "@vitejs/plugin-react";
+
+export default defineConfig({
+  plugins: [react()],
+  server: { port: 5173, strictPort: true }
+});
+###########################################################3
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+    <title>FlightOps — AG-UI</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>
+##########################################################
+import React from "react";
+import { createRoot } from "react-dom/client";
+import App from "./App.jsx";
+
+createRoot(document.getElementById("root")).render(
+  <React.StrictMode>
+    <App />
+  </React.StrictMode>
+);
+########################################################3
+export async function* aguiStream(url, payload) {
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {"Content-Type":"application/json"},
+    body: JSON.stringify(payload)
+  });
+
+  if (!res.ok || !res.body) {
+    throw new Error(`Bad response: ${res.status} ${res.statusText}`);
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    let idx;
+    while ((idx = buf.indexOf("\n")) >= 0) {
+      const line = buf.slice(0, idx).trim();
+      buf = buf.slice(idx + 1);
+      if (!line) continue;
+      try {
+        const ev = JSON.parse(line);
+        yield ev;
+      } catch {}
+    }
+  }
+}
+###############################################
+export default function Chat({ messages }) {
+  return (
+    <div style={{ margin: "12px 0", padding: 12, border: "1px solid #eee" }}>
+      {messages.map((m, i) => (
+        <div key={i} style={{ whiteSpace: "pre-wrap", marginBottom: 8 }}>
+          <b>{m.role}:</b> {m.content}
+        </div>
+      ))}
+    </div>
+  );
+}
+##########################################################
+export default function ToolStatus({ runs }) {
+  const ids = Object.keys(runs);
+  if (!ids.length) return null;
+  return (
+    <div style={{ margin: "12px 0", padding: 12, border: "1px solid #eee" }}>
+      <b>Tool Calls</b>
+      {ids.map((id) => {
+        const r = runs[id];
+        return (
+          <div key={id} style={{ fontSize: 14, marginTop: 6 }}>
+            #{id.slice(0, 8)} {r.name} — {r.status || "running"}
+            {r.args ? <div>args: <code>{JSON.stringify(r.args)}</code></div> : null}
+            {r.result ? <div>result: <code>{JSON.stringify(r.result)}</code></div> : null}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+######################################################3
+import { useState } from "react";
+import { aguiStream } from "./aguiClient";
+import Chat from "./components/Chat";
+import ToolStatus from "./components/ToolStatus";
+
+const BACKEND_URL = "http://localhost:8001/agui/chat"; // change if needed
+
+export default function App() {
+  const [messages, setMessages] = useState([]);
+  const [toolRuns, setToolRuns] = useState({});
+  const [input, setInput] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const appendAssistantChunk = (messageId, chunk) => {
+    const safeText = typeof chunk === "string" ? chunk : JSON.stringify(chunk, null, 2);
+    setMessages((m) => {
+      const copy = [...m];
+      const idx = copy.findIndex(x => x.messageId === messageId && x.role === "assistant");
+      if (idx === -1) copy.push({ role: "assistant", content: safeText, messageId });
+      else copy[idx] = { ...copy[idx], content: (copy[idx].content || "") + safeText };
+      return copy;
+    });
+  };
+
+  const send = async () => {
+    if (!input.trim() || busy) return;
+    setBusy(true);
+    const userMsg = { role: "user", content: input };
+    setMessages((m) => [...m, userMsg]);
+    setInput("");
+
+    try {
+      const payload = { messages: [...messages, userMsg], state: {} };
+      for await (const ev of aguiStream(BACKEND_URL, payload)) {
+        switch (ev.type) {
+          case "TEXT_MESSAGE_START":
+            setMessages((m) => [...m, { role: "assistant", content: "", messageId: ev.messageId }]);
+            break;
+          case "TEXT_MESSAGE_CONTENT":
+            appendAssistantChunk(ev.messageId, ev.text || "");
+            break;
+          case "TEXT_MESSAGE_END":
+            break;
+          case "TOOL_CALL_START":
+            setToolRuns((t) => ({ ...t, [ev.toolCallId]: { name: ev.name, status: "running" } }));
+            break;
+          case "TOOL_CALL_ARGS":
+            setToolRuns((t) => ({ ...t, [ev.toolCallId]: { ...t[ev.toolCallId], args: ev.args } }));
+            break;
+          case "TOOL_CALL_RESULT":
+            setToolRuns((t) => ({ ...t, [ev.toolCallId]: { ...t[ev.toolCallId], result: ev.result } }));
+            break;
+          case "TOOL_CALL_END":
+            setToolRuns((t) => ({ ...t, [ev.toolCallId]: { ...t[ev.toolCallId], status: ev.ok ? "ok" : "error" } }));
+            break;
+          case "STATE_DELTA":
+            // (optional) apply JSON Patch to local state
+            break;
+          default:
+            break;
+        }
+      }
+    } catch (e) {
+      setMessages((m) => [...m, { role: "assistant", content: `Error: ${e.message}` }]);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div style={{ maxWidth: 800, margin: "24px auto", fontFamily: "system-ui, sans-serif" }}>
+      <h2>FlightOps — AG-UI (React)</h2>
+      <Chat messages={messages} />
+      <ToolStatus runs={toolRuns} />
+      <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
+        <input
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          placeholder="Type your query…"
+          style={{ flex: 1, padding: 8 }}
+          onKeyDown={(e) => e.key === "Enter" && send()}
+        />
+        <button onClick={send} disabled={busy} style={{ padding: "8px 12px" }}>
+          {busy ? "Working…" : "Send"}
+        </button>
+      </div>
+    </div>
+  );
+}
