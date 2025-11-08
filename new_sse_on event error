@@ -1,0 +1,476 @@
+import os
+import json
+import asyncio
+import logging
+from typing import AsyncGenerator, Callable
+
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse, PlainTextResponse
+from pydantic import BaseModel
+
+# >>> IMPORTANT: we reuse your FlightOpsMCPClient from server.py
+# server.py must be in PYTHONPATH or same folder as this file.
+from server import FlightOpsMCPClient
+
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+log = logging.getLogger("agui.fastapi")
+
+app = FastAPI(title="AG-UI FastAPI Gateway")
+
+# --- CORS (Vite dev on 5173) ---
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+class QueryBody(BaseModel):
+    userprompt: str
+
+@app.get("/health", response_class=PlainTextResponse)
+async def health():
+    return "OK"
+
+def sse_format(event: str, data: dict | str) -> bytes:
+    """Format a single SSE event block."""
+    if isinstance(data, (dict, list)):
+        payload = json.dumps(data, ensure_ascii=False)
+    else:
+        payload = str(data)
+    block = f"event: {event}\n" + "\n".join(
+        [f"data: {line}" for line in payload.splitlines() or [""]]
+    ) + "\n\n"
+    return block.encode("utf-8")
+
+def chunk_text(txt: str, size: int = 400) -> list[str]:
+    txt = txt or ""
+    return [txt[i:i+size] for i in range(0, len(txt), size)] or [""]
+
+async def stream_text(event_send: Callable[[str, dict | str], asyncio.Future], text: str):
+    """Stream a long text as incremental TEXT_MESSAGE_CONTENT chunks."""
+    for chunk in chunk_text(text, 400):
+        await event_send("TEXT_MESSAGE_CONTENT", {"text": chunk})
+        # tiny delay for UI feel
+        await asyncio.sleep(0.01)
+
+@app.post("/get_data")
+async def get_data(req: Request, body: QueryBody):
+    """
+    Streams back AG-UI style events over SSE:
+      - RUN_STARTED
+      - THINKING (planning)
+      - STATE_DELTA (plan_ready / tool_started / tool_finished / summarize_started / summarize_finished)
+      - TOOL_CALL_STARTED / TOOL_CALL_FINISHED
+      - TEXT_MESSAGE_CONTENT (assistant streaming text)
+      - RUN_FINISHED
+    """
+    userprompt = body.userprompt.strip()
+    client = FlightOpsMCPClient()
+
+    async def event_gen() -> AsyncGenerator[bytes, None]:
+        # Helper to send events
+        async def send(event: str, data: dict | str):
+            yield sse_format(event, data)
+
+        # Wrapper so we can call it with 'await event_send(...)' above
+        async def event_send(event: str, data: dict | str):
+            nonlocal queue
+            await queue.put(sse_format(event, data))
+
+        # A small queue so we can yield from a single generator
+        queue: asyncio.Queue[bytes] = asyncio.Queue()
+
+        async def producer():
+            # 1) RUN_STARTED
+            await queue.put(sse_format("RUN_STARTED", {"run_id": "run-" + os.urandom(4).hex()}))
+
+            # 2) THINKING (planning)
+            await queue.put(sse_format("THINKING", {"stage": "planning"}))
+
+            # 3) PLAN
+            try:
+                plan_data = client.plan_tools(userprompt)
+            except Exception as e:
+                await queue.put(sse_format("STATE_DELTA", {"stage": "plan_failed", "error": str(e)}))
+                await queue.put(sse_format("RUN_FINISHED", {"status": "error"}))
+                await queue.put(b"")
+                return
+
+            plan = plan_data.get("plan", [])
+            await queue.put(sse_format("STATE_DELTA", {"stage": "plan_ready", "plan": plan}))
+
+            results = []
+
+            # 4) Execute tools one-by-one
+            for i, step in enumerate(plan):
+                tool = step.get("tool")
+                args = step.get("arguments", {}) or {}
+                # sanitize args (removes blanks/"unknown")
+                args = {k: v for k, v in args.items() if v and str(v).strip().lower() != "unknown"}
+
+                await queue.put(sse_format("STATE_DELTA", {"stage": "tool_started", "tool": tool, "args": args}))
+                await queue.put(sse_format("TOOL_CALL_STARTED", {"tool": tool, "args": args}))
+
+                try:
+                    resp = await client.invoke_tool(tool, args)
+                except Exception as e:
+                    resp = {"error": str(e)}
+
+                await queue.put(sse_format("TOOL_CALL_FINISHED", {"tool": tool, "result": resp}))
+                await queue.put(sse_format("STATE_DELTA", {"stage": "tool_finished", "tool": tool}))
+                results.append({tool: resp})
+
+            # 5) THINKING (summarize)
+            await queue.put(sse_format("THINKING", {"stage": "summarizing"}))
+            await queue.put(sse_format("STATE_DELTA", {"stage": "summarize_started"}))
+
+            try:
+                summary_obj = client.summarize_results(userprompt, plan, results)
+                summary_text = (summary_obj or {}).get("summary", "") or ""
+            except Exception as e:
+                summary_text = f"Summary failed: {e}"
+
+            # 6) Stream assistant text
+            await stream_text(event_send, summary_text)
+
+            await queue.put(sse_format("STATE_DELTA", {"stage": "summarize_finished"}))
+            await queue.put(sse_format("RUN_FINISHED", {"status": "ok"}))
+            await queue.put(b"")
+
+        # Fire producer and drain queue
+        task = asyncio.create_task(producer())
+        try:
+            while True:
+                chunk = await queue.get()
+                if chunk == b"":
+                    break
+                yield chunk
+        finally:
+            task.cancel()
+
+    headers = {
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "Content-Type": "text/event-stream; charset=utf-8",
+    }
+    return StreamingResponse(event_gen(), headers=headers)
+#############################################################################
+{
+  "name": "flightops-assistant-ui",
+  "private": true,
+  "version": "0.0.1",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --port 5173",
+    "build": "vite build",
+    "preview": "vite preview --port 5173"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "vite": "^5.4.0"
+  }
+}
+############################################################3
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+    <title>FlightOps Assistant</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>
+#################################################################3
+import React from "react";
+import { createRoot } from "react-dom/client";
+import App from "./App.jsx";
+import "./styles.css";
+
+createRoot(document.getElementById("root")).render(
+  <React.StrictMode>
+    <App />
+  </React.StrictMode>
+);
+#####################################################33
+// Small utilities to parse Server-Sent Events and chunk text
+
+export function parseSSEChunks(rawText) {
+  // Splits SSE stream into discrete event blocks separated by blank lines
+  const blocks = rawText.split(/\r?\n\r?\n/);
+  const events = [];
+
+  for (const block of blocks) {
+    if (!block.trim()) continue;
+    let ev = { event: "message", data: "" };
+
+    const lines = block.split(/\r?\n/);
+    for (const line of lines) {
+      if (line.startsWith("event:")) {
+        ev.event = line.slice(6).trim();
+      } else if (line.startsWith("data:")) {
+        ev.data += (ev.data ? "\n" : "") + line.slice(5).trim();
+      }
+    }
+    if (ev.data) {
+      try {
+        ev.data = JSON.parse(ev.data);
+      } catch {
+        // keep as string
+      }
+      events.push(ev);
+    }
+  }
+  return events;
+}
+
+export function chunkText(text, size = 400) {
+  if (!text) return [""];
+  const out = [];
+  for (let i = 0; i < text.length; i += size) {
+    out.push(text.slice(i, i + size));
+  }
+  return out;
+}
+##################################################33
+// Streams POST /get_data (SSE in the response body)
+export async function* postSSE(url, payload) {
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
+    body: JSON.stringify(payload),
+  });
+
+  if (!resp.ok || !resp.body) {
+    throw new Error(`HTTP ${resp.status} ${resp.statusText}`);
+  }
+
+  const reader = resp.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+
+    buffer += decoder.decode(value, { stream: true });
+
+    // Process complete SSE blocks
+    const parts = buffer.split(/\r?\n\r?\n/);
+    buffer = parts.pop() ?? "";
+    for (const part of parts) {
+      if (!part.trim()) continue;
+
+      // normalize to single event/data block
+      const lines = part.split(/\r?\n/);
+      let event = "message";
+      let data = "";
+
+      for (const ln of lines) {
+        if (ln.startsWith("event:")) event = ln.slice(6).trim();
+        if (ln.startsWith("data:")) data += (data ? "\n" : "") + ln.slice(5).trim();
+      }
+
+      try {
+        yield { event, data: data ? JSON.parse(data) : {} };
+      } catch {
+        yield { event, data };
+      }
+    }
+  }
+
+  // Flush remaining buffer
+  if (buffer.trim()) {
+    const lines = buffer.split(/\r?\n/);
+    let event = "message";
+    let data = "";
+    for (const ln of lines) {
+      if (ln.startsWith("event:")) event = ln.slice(6).trim();
+      if (ln.startsWith("data:")) data += (data ? "\n" : "") + ln.slice(5).trim();
+    }
+    try {
+      yield { event, data: data ? JSON.parse(data) : {} };
+    } catch {
+      yield { event, data };
+    }
+  }
+}
+#########################################################################3
+import React, { useState, useRef } from "react";
+import { postSSE } from "./api.js";
+import { chunkText } from "./sseHelpers.js";
+
+const BACKEND = "http://127.0.0.1:8001";
+
+export default function App() {
+  const [prompt, setPrompt] = useState("6E 215 status today");
+  const [busy, setBusy] = useState(false);
+  const [thinking, setThinking] = useState(false);
+  const [processing, setProcessing] = useState(false);
+  const [done, setDone] = useState(false);
+
+  const [transcript, setTranscript] = useState("");
+  const [logs, setLogs] = useState([]);
+  const abortRef = useRef(null);
+
+  const pushLog = (obj) => {
+    setLogs((prev) => [
+      ...prev,
+      { t: new Date().toLocaleTimeString(), ...obj },
+    ]);
+  };
+
+  const handleStop = () => {
+    if (abortRef.current) {
+      abortRef.current.abort();
+      pushLog({ type: "info", msg: "aborted by user" });
+      setBusy(false);
+      setThinking(false);
+      setProcessing(false);
+    }
+  };
+
+  const handleSend = async () => {
+    setBusy(true);
+    setThinking(false);
+    setProcessing(false);
+    setDone(false);
+    setTranscript("");
+    setLogs([]);
+
+    const controller = new AbortController();
+    abortRef.current = controller;
+
+    try {
+      for await (const evt of postSSE(`${BACKEND}/get_data`, { userprompt: prompt })) {
+        switch (evt.event) {
+          case "RUN_STARTED":
+            pushLog({ type: "run", msg: `run started (${evt.data?.run_id || ""})` });
+            setThinking(true);
+            break;
+
+          case "THINKING":
+            setThinking(true);
+            pushLog({ type: "thinking", msg: evt.data?.stage || "thinking" });
+            break;
+
+          case "STATE_DELTA":
+            if (evt.data?.stage === "plan_ready") {
+              pushLog({ type: "plan", msg: "plan ready", plan: evt.data.plan });
+              setProcessing(true);
+            } else if (evt.data?.stage === "tool_started") {
+              pushLog({ type: "tool", msg: `tool started: ${evt.data.tool}`, args: evt.data.args });
+            } else if (evt.data?.stage === "tool_finished") {
+              pushLog({ type: "tool", msg: `tool finished: ${evt.data.tool}` });
+            } else if (evt.data?.stage === "summarize_started") {
+              pushLog({ type: "info", msg: "summarize started" });
+            } else if (evt.data?.stage === "summarize_finished") {
+              pushLog({ type: "info", msg: "summarize finished" });
+            }
+            break;
+
+          case "TOOL_CALL_STARTED":
+            pushLog({ type: "tool_call", msg: `→ ${evt.data.tool}`, args: evt.data.args });
+            break;
+
+          case "TOOL_CALL_FINISHED":
+            pushLog({ type: "tool_result", msg: `← ${evt.data.tool}`, result: evt.data.result });
+            break;
+
+          case "TEXT_MESSAGE_CONTENT":
+            setThinking(false);
+            setProcessing(true);
+            setTranscript((prev) => prev + (evt.data?.text || ""));
+            break;
+
+          case "RUN_FINISHED":
+            setBusy(false);
+            setThinking(false);
+            setProcessing(false);
+            setDone(true);
+            pushLog({ type: "run", msg: `run finished (${evt.data?.status || "ok"})` });
+            break;
+
+          default:
+            pushLog({ type: "event", msg: evt.event, data: evt.data });
+        }
+      }
+    } catch (err) {
+      pushLog({ type: "error", msg: String(err) });
+    } finally {
+      setBusy(false);
+      abortRef.current = null;
+    }
+  };
+
+  return (
+    <div className="app">
+      <header>
+        <h1>FlightOps Assistant (IndiGo)</h1>
+        <div className="small">Vite + React (JS) • Streaming SSE</div>
+      </header>
+
+      <div className="controls">
+        <textarea
+          placeholder="Type your flight ops query…"
+          value={prompt}
+          onChange={(e) => setPrompt(e.target.value)}
+        />
+        <div className="buttons">
+          <button onClick={handleSend} disabled={busy || !prompt.trim()}>Send</button>
+          <button onClick={handleStop} disabled={!busy}>Stop</button>
+          <button onClick={() => { setTranscript(""); setLogs([]); setDone(false); }}>Clear</button>
+        </div>
+
+        <div className="badges">
+          {thinking && <span className="badge thinking">🧠 Thinking…</span>}
+          {processing && <span className="badge processing">⚙️ Processing…</span>}
+          {done && <span className="badge done">✅ Done</span>}
+        </div>
+      </div>
+
+      <div className="stream">
+        <div className="transcript">
+          {transcript || <span className="small">Assistant response will stream here…</span>}
+        </div>
+        <div className="tool-logs">
+          {logs.length === 0 && <div className="small">Tool logs will appear here…</div>}
+          {logs.map((l, i) => (
+            <div className="log" key={i}>
+              <span className="kv">{l.t}</span> — <strong>{l.type}</strong>: {l.msg}
+              {l.plan && <pre>{JSON.stringify(l.plan, null, 2)}</pre>}
+              {l.args && <pre>{JSON.stringify(l.args, null, 2)}</pre>}
+              {l.result && <pre>{JSON.stringify(l.result, null, 2)}</pre>}
+              {l.data && <pre>{JSON.stringify(l.data, null, 2)}</pre>}
+            </div>
+          ))}
+        </div>
+      </div>
+
+      <div className="footer">
+        Built by Deeksha • Project: FlightOps Assistant
+      </div>
+    </div>
+  );
+}
+##################################################################################3
+# health
+Invoke-WebRequest http://127.0.0.1:8001/health
+
+# tools
+Invoke-WebRequest http://127.0.0.1:8001/tools
+
+# streaming test (raw SSE dump)
+$body = @{ userprompt = "6E 215 status today" } | ConvertTo-Json
+Invoke-WebRequest -Uri "http://127.0.0.1:8001/get_data" -Method Post -Body $body -ContentType "application/json"
