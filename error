@@ -86,5 +86,69 @@ Links             : {}
 ParsedHtml        : mshtml.HTMLDocumentClass
 RawContentLength  : 846
 ########################################################
+new different error
+agui) PS C:\Users\Deeksha.x.Srivastava\OneDrive - InterGlobe Aviation Limited\Desktop\new_mcp_ui\frontend> npm install
+npm warn cleanup Failed to remove some directories [
+npm warn cleanup   [
+npm warn cleanup     'C:\\Users\\Deeksha.x.Srivastava\\OneDrive - InterGlobe Aviation Limited\\Desktop\\new_mcp_ui\\frontend\\node_modules\\@esbuild\\.win32-x64-qiPjKc0e',
+npm warn cleanup     [Error: EPERM: operation not permitted, unlink 'C:\Users\Deeksha.x.Srivastava\OneDrive - InterGlobe Aviation Limited\Desktop\new_mcp_ui\frontend\node_modules\@esbuild\.win32-x64-qiPjKc0e\esbuild.exe'] {
+npm warn cleanup       errno: -4048,
+npm warn cleanup       code: 'EPERM',
+npm warn cleanup       syscall: 'unlink',
+npm warn cleanup       path: 'C:\\Users\\Deeksha.x.Srivastava\\OneDrive - InterGlobe Aviation Limited\\Desktop\\new_mcp_ui\\frontend\\node_modules\\@esbuild\\.win32-x64-qiPjKc0e\\esbuild.exe'
+npm warn cleanup     }
+npm warn cleanup   ],
+npm warn cleanup   [
+npm warn cleanup     'C:\\Users\\Deeksha.x.Srivastava\\OneDrive - InterGlobe Aviation Limited\\Desktop\\new_mcp_ui\\frontend\\node_modules\\.balanced-match-eIHGaMLG',
+npm warn cleanup     [Error: EBUSY: resource busy or locked, rmdir 'C:\Users\Deeksha.x.Srivastava\OneDrive - InterGlobe Aviation Limited\Desktop\new_mcp_ui\frontend\node_modules\.balanced-match-eIHGaMLG'] {
+npm warn cleanup       errno: -4082,
+npm warn cleanup       code: 'EBUSY',
+npm warn cleanup       syscall: 'rmdir',
+npm warn cleanup       path: 'C:\\Users\\Deeksha.x.Srivastava\\OneDrive - InterGlobe Aviation Limited\\Desktop\\new_mcp_ui\\frontend\\node_modules\\.balanced-match-eIHGaMLG'
+npm warn cleanup     }
+npm warn cleanup   ]
+npm warn cleanup ]
+
+added 1 package, removed 138 packages, changed 6 packages, and audited 17 packages in 29s
+
+3 packages are looking for funding
+  run `npm fund` for details
+
+2 moderate severity vulnerabilities
+
+To address all issues (including breaking changes), run:
+  npm audit fix --force
+
+Run `npm audit` for details.
+(agui) PS C:\Users\Deeksha.x.Srivastava\OneDrive - InterGlobe Aviation Limited\Desktop\new_mcp_ui\frontend> npm install
+
+up to date, audited 17 packages in 2s
+
+3 packages are looking for funding
+  run `npm fund` for details
+
+2 moderate severity vulnerabilities
+
+To address all issues (including breaking changes), run:
+  npm audit fix --force
+
+Run `npm audit` for details.
+(agui) PS C:\Users\Deeksha.x.Srivastava\OneDrive - InterGlobe Aviation Limited\Desktop\new_mcp_ui\frontend> npm run dev
+
+> frontend@0.0.1 dev
+> vite --port 5173
+
+failed to load config from C:\Users\Deeksha.x.Srivastava\OneDrive - InterGlobe Aviation Limited\Desktop\new_mcp_ui\frontend\vite.config.js
+error when starting dev server:
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package '@vitejs/plugin-react' imported from C:\Users\Deeksha.x.Srivastava\OneDrive - InterGlobe Aviation Limited\Desktop\new_mcp_ui\frontend\vite.config.js.timestamp-1762578164498-103b1b421cfd3.mjs
+    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:266:9)
+    at packageResolve (node:internal/modules/esm/resolve:767:81)
+    at moduleResolve (node:internal/modules/esm/resolve:853:18)
+    at defaultResolve (node:internal/modules/esm/resolve:983:11)
+    at #cachedDefaultResolve (node:internal/modules/esm/loader:717:20)
+    at ModuleLoader.resolve (node:internal/modules/esm/loader:694:38)
+    at ModuleLoader.getModuleJobForImport (node:internal/modules/esm/loader:308:38)
+    at ModuleJob._link (node:internal/modules/esm/module_job:183:49)
+(agui) PS C:\Users\Deeksha.x.Srivastava\OneDrive - InterGlobe Aviation Limited\Desktop\new_mcp_ui\frontend> 
 
 
