@@ -1,0 +1,769 @@
+# server.py
+import os
+import logging
+import json
+from typing import Optional, Any, Dict
+from datetime import datetime
+from motor.motor_asyncio import AsyncIOMotorClient
+from dotenv import load_dotenv
+load_dotenv()
+
+from mcp.server.fastmcp import FastMCP
+
+HOST = os.getenv("MCP_HOST", "127.0.0.1")
+PORT = int(os.getenv("MCP_PORT", "8000"))
+TRANSPORT = os.getenv("MCP_TRANSPORT", "streamable-http")
+
+MONGODB_URL = os.getenv("MONGO_URI")
+DATABASE_NAME = os.getenv("MONGO_DB")
+COLLECTION_NAME = os.getenv("MONGO_COLLECTION")
+
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+logger = logging.getLogger("flightops.mcp.server")
+
+mcp = FastMCP("FlightOps MCP Server")
+
+_mongo_client: Optional[AsyncIOMotorClient] = None
+_db = None
+_col = None
+
+async def get_mongodb_client():
+    global _mongo_client, _db, _col
+    if _mongo_client is None:
+        logger.info("Connecting to MongoDB: %s", MONGODB_URL)
+        _mongo_client = AsyncIOMotorClient(MONGODB_URL)
+        _db = _mongo_client[DATABASE_NAME]
+        _col = _db[COLLECTION_NAME]
+    return _mongo_client, _db, _col
+
+def normalize_flight_number(flight_number: Any) -> Optional[int]:
+    if flight_number is None or flight_number == "":
+        return None
+    if isinstance(flight_number, int):
+        return flight_number
+    try:
+        return int(str(flight_number).strip())
+    except (ValueError, TypeError):
+        logger.warning(f"Could not normalize flight_number: {flight_number}")
+        return None
+
+def validate_date(date_str: str) -> Optional[str]:
+    if not date_str or date_str == "":
+        return None
+    formats = [
+        "%Y-%m-%d", "%d-%m-%Y", "%Y/%m/%d", "%d/%m/%Y",
+        "%B %d, %Y", "%d %B %Y", "%b %d, %Y", "%d %b %Y"
+    ]
+    for fmt in formats:
+        try:
+            dt = datetime.strptime(date_str, fmt)
+            return dt.strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    logger.warning(f"Could not parse date: {date_str}")
+    return None
+
+def make_query(carrier: str, flight_number: Optional[int], date_of_origin: str) -> Dict:
+    query = {}
+    if carrier:
+        query["flightLegState.carrier"] = carrier
+    if flight_number is not None:
+        query["flightLegState.flightNumber"] = flight_number
+    if date_of_origin:
+        query["flightLegState.dateOfOrigin"] = date_of_origin
+    logger.info(f"Built query: {json.dumps(query)}")
+    return query
+
+def response_ok(data: Any) -> str:
+    return json.dumps({"ok": True, "data": data}, indent=2, default=str)
+
+def response_error(msg: str, code: int = 400) -> str:
+    return json.dumps({"ok": False, "error": {"message": msg, "code": code}}, indent=2)
+
+async def _fetch_one_async(query: dict, projection: dict) -> str:
+    try:
+        _, _, col = await get_mongodb_client()
+        logger.info(f"Executing query: {json.dumps(query)}")
+        result = await col.find_one(query, projection)
+        if not result:
+            logger.warning(f"No document found for query: {json.dumps(query)}")
+            return response_error("No matching document found.", code=404)
+        result.pop("_id", None)
+        result.pop("_class", None)
+        return response_ok(result)
+    except Exception as exc:
+        logger.exception("DB query failed")
+        return response_error(f"DB query failed: {str(exc)}", code=500)
+
+@mcp.tool()
+async def health_check() -> str:
+    try:
+        _, _, col = await get_mongodb_client()
+        doc = await col.find_one({}, {"_id": 1})
+        return response_ok({"status": "ok", "db_connected": doc is not None})
+    except Exception:
+        return response_error("DB unreachable", code=503)
+
+@mcp.tool()
+async def get_flight_basic_info(carrier: str = "", flight_number: str = "", date_of_origin: str = "") -> str:
+    fn = normalize_flight_number(flight_number) if flight_number else None
+    dob = validate_date(date_of_origin) if date_of_origin else None
+    if date_of_origin and not dob:
+        return response_error("Invalid date_of_origin format.", 400)
+    query = make_query(carrier, fn, dob)
+    projection = {
+        "flightLegState.carrier": 1,
+        "flightLegState.flightNumber": 1,
+        "flightLegState.suffix": 1,
+        "flightLegState.dateOfOrigin": 1,
+        "flightLegState.seqNumber": 1,
+        "flightLegState.startStation": 1,
+        "flightLegState.endStation": 1,
+        "flightLegState.startStationICAO": 1,
+        "flightLegState.endStationICAO": 1,
+        "flightLegState.scheduledStartTime": 1,
+        "flightLegState.scheduledEndTime": 1,
+        "flightLegState.flightStatus": 1,
+        "flightLegState.operationalStatus": 1,
+        "flightLegState.flightType": 1,
+        "flightLegState.blockTimeSch": 1,
+        "flightLegState.blockTimeActual": 1,
+        "flightLegState.flightHoursActual": 1,
+        "flightLegState.isOTPFlight": 1,
+        "flightLegState.isOTPAchieved": 1,
+        "flightLegState.isOTPConsidered": 1,
+        "flightLegState.isOTTFlight": 1,
+        "flightLegState.isOTTAchievedFlight": 1,
+        "flightLegState.turnTimeFlightBeforeActual": 1,
+        "flightLegState.turnTimeFlightBeforeSch": 1
+    }
+    return await _fetch_one_async(query, projection)
+
+@mcp.tool()
+async def get_operation_times(carrier: str = "", flight_number: str = "", date_of_origin: str = "") -> str:
+    fn = normalize_flight_number(flight_number) if flight_number else None
+    dob = validate_date(date_of_origin) if date_of_origin else None
+    if date_of_origin and not dob:
+        return response_error("Invalid date format.", 400)
+    query = make_query(carrier, fn, dob)
+    projection = {
+        "flightLegState.carrier": 1,
+        "flightLegState.flightNumber": 1,
+        "flightLegState.dateOfOrigin": 1,
+        "flightLegState.startStation": 1,
+        "flightLegState.endStation": 1,
+        "flightLegState.scheduledStartTime": 1,
+        "flightLegState.scheduledEndTime": 1,
+        "flightLegState.startTimeOffset": 1,
+        "flightLegState.endTimeOffset": 1,
+        "flightLegState.operation.estimatedTimes": 1,
+        "flightLegState.operation.actualTimes": 1,
+        "flightLegState.taxiOutTime": 1,
+        "flightLegState.taxiInTime": 1,
+        "flightLegState.blockTimeSch": 1,
+        "flightLegState.blockTimeActual": 1,
+        "flightLegState.flightHoursActual": 1,
+    }
+    return await _fetch_one_async(query, projection)
+
+@mcp.tool()
+async def get_equipment_info(carrier: str = "", flight_number: str = "", date_of_origin: str = "") -> str:
+    fn = normalize_flight_number(flight_number) if flight_number else None
+    dob = validate_date(date_of_origin) if date_of_origin else None
+    query = make_query(carrier, fn, dob)
+    projection = {
+        "flightLegState.carrier": 1,
+        "flightLegState.flightNumber": 1,
+        "flightLegState.dateOfOrigin": 1,
+        "flightLegState.equipment.plannedAircraftType": 1,
+        "flightLegState.equipment.aircraft": 1,
+        "flightLegState.equipment.aircraftConfiguration": 1,
+        "flightLegState.equipment.aircraftRegistration": 1,
+        "flightLegState.equipment.assignedAircraftTypeIATA": 1,
+        "flightLegState.equipment.assignedAircraftTypeICAO": 1,
+        "flightLegState.equipment.assignedAircraftTypeIndigo": 1,
+        "flightLegState.equipment.assignedAircraftConfiguration": 1,
+        "flightLegState.equipment.tailLock": 1,
+        "flightLegState.equipment.onwardFlight": 1,
+        "flightLegState.equipment.actualOnwardFlight": 1
+    }
+    return await _fetch_one_async(query, projection)
+
+@mcp.tool()
+async def get_delay_summary(carrier: str = "", flight_number: str = "", date_of_origin: str = "") -> str:
+    fn = normalize_flight_number(flight_number) if flight_number else None
+    dob = validate_date(date_of_origin) if date_of_origin else None
+    query = make_query(carrier, fn, dob)
+    projection = {
+        "flightLegState.carrier": 1,
+        "flightLegState.flightNumber": 1,
+        "flightLegState.dateOfOrigin": 1,
+        "flightLegState.startStation": 1,
+        "flightLegState.endStation": 1,
+        "flightLegState.scheduledStartTime": 1,
+        "flightLegState.operation.actualTimes.offBlock": 1,
+        "flightLegState.delays": 1
+    }
+    return await _fetch_one_async(query, projection)
+
+@mcp.tool()
+async def get_fuel_summary(carrier: str = "", flight_number: str = "", date_of_origin: str = "") -> str:
+    fn = normalize_flight_number(flight_number) if flight_number else None
+    dob = validate_date(date_of_origin) if date_of_origin else None
+    query = make_query(carrier, fn, dob)
+    projection = {
+        "flightLegState.carrier": 1,
+        "flightLegState.flightNumber": 1,
+        "flightLegState.dateOfOrigin": 1,
+        "flightLegState.startStation": 1,
+        "flightLegState.endStation": 1,
+        "flightLegState.operation.fuel": 1,
+        "flightLegState.operation.flightPlan.offBlockFuel": 1,
+        "flightLegState.operation.flightPlan.takeoffFuel": 1,
+        "flightLegState.operation.flightPlan.landingFuel": 1,
+        "flightLegState.operation.flightPlan.holdFuel": 1
+    }
+    return await _fetch_one_async(query, projection)
+
+@mcp.tool()
+async def get_passenger_info(carrier: str = "", flight_number: str = "", date_of_origin: str = "") -> str:
+    fn = normalize_flight_number(flight_number) if flight_number else None
+    dob = validate_date(date_of_origin) if date_of_origin else None
+    query = make_query(carrier, fn, dob)
+    projection = {
+        "flightLegState.carrier": 1,
+        "flightLegState.flightNumber": 1,
+        "flightLegState.dateOfOrigin": 1,
+        "flightLegState.pax": 1
+    }
+    return await _fetch_one_async(query, projection)
+
+@mcp.tool()
+async def get_crew_info(carrier: str = "", flight_number: str = "", date_of_origin: str = "") -> str:
+    fn = normalize_flight_number(flight_number) if flight_number else None
+    dob = validate_date(date_of_origin) if date_of_origin else None
+    query = make_query(carrier, fn, dob)
+    projection = {
+        "flightLegState.carrier": 1,
+        "flightLegState.flightNumber": 1,
+        "flightLegState.dateOfOrigin": 1,
+        "flightLegState.crewConnections": 1
+    }
+    return await _fetch_one_async(query, projection)
+
+@mcp.tool()
+async def raw_mongodb_query(query_json: str, projection: str = "", limit: int = 10) -> str:
+    def _safe_json_loads(text: str) -> dict:
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            return json.loads(text.replace("'", '"'))
+
+    try:
+        _, _, col = await get_mongodb_client()
+        try:
+            query = _safe_json_loads(query_json)
+        except Exception as e:
+            return response_error(f"Invalid query_json: {e}", 400)
+
+        projection_dict = None
+        if projection:
+            try:
+                projection_dict = _safe_json_loads(projection)
+            except Exception as e:
+                return response_error(f"Invalid projection: {e}", 400)
+
+        if not isinstance(query, dict):
+            return response_error("query_json must be a JSON object.", 400)
+        if projection_dict and not isinstance(projection_dict, dict):
+            return response_error("projection must be a JSON object.", 400)
+
+        limit = min(max(1, int(limit)), 50)
+        if not projection_dict:
+            projection_dict = {
+                "_id": 0,
+                "flightLegState.carrier": 1,
+                "flightLegState.flightNumber": 1,
+                "flightLegState.dateOfOrigin": 1
+            }
+
+        cursor = col.find(query, projection_dict).sort("flightLegState.dateOfOrigin", -1).limit(limit)
+        docs = []
+        async for doc in cursor:
+            doc.pop("_id", None)
+            doc.pop("_class", None)
+            docs.append(doc)
+
+        if not docs:
+            return response_error("No documents found.", 404)
+
+        return response_ok({"count": len(docs), "query": query, "projection": projection_dict, "documents": docs})
+    except Exception as exc:
+        logger.exception("raw_mongodb_query failed")
+        return response_error(f"Raw MongoDB query failed: {str(exc)}", 500)
+
+@mcp.tool()
+async def run_aggregated_query(
+    query_type: str = "",
+    carrier: str = "",
+    field: str = "",
+    start_date: str = "",
+    end_date: str = "",
+    filter_json: str = ""
+) -> str:
+    _, _, col = await get_mongodb_client()
+    match_stage = {}
+    if filter_json:
+        try:
+            match_stage.update(json.loads(filter_json.replace("'", '"')))
+        except Exception as e:
+            return response_error(f"Invalid filter_json: {e}", 400)
+    if carrier:
+        match_stage["flightLegState.carrier"] = carrier
+    if start_date and end_date:
+        match_stage["flightLegState.dateOfOrigin"] = {"$gte": start_date, "$lte": end_date}
+
+    agg_map = {
+        "average": {"$avg": f"${field}"},
+        "sum": {"$sum": f"${field}"},
+        "min": {"$min": f"${field}"},
+        "max": {"$max": f"${field}"},
+        "count": {"$sum": 1},
+    }
+    if query_type not in agg_map:
+        return response_error("Unsupported query_type.", 400)
+
+    pipeline = [{"$match": match_stage}, {"$group": {"_id": None, "value": agg_map[query_type]}}]
+    try:
+        docs = await col.aggregate(pipeline).to_list(length=10)
+        return response_ok({"pipeline": pipeline, "results": docs})
+    except Exception as e:
+        logger.exception("Aggregation query failed")
+        return response_error(f"Aggregation failed: {str(e)}", 500)
+
+if __name__ == "__main__":
+    logger.info("Starting FlightOps MCP Server on %s:%s (transport=%s)", HOST, PORT, TRANSPORT)
+    logger.info("MongoDB URL: %s, Database: %s, Collection: %s", MONGODB_URL, DATABASE_NAME, COLLECTION_NAME)
+    mcp.run(transport="streamable-http")
+############################################
+# client.py
+import os, json, logging, asyncio
+from typing import Dict, Any
+from dotenv import load_dotenv
+from openai import AzureOpenAI
+from mcp import ClientSession
+from mcp.client.streamable_http import streamablehttp_client
+
+from tool_registry import TOOLS
+
+load_dotenv()
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+logger = logging.getLogger("FlightOps.MCPClient")
+
+MCP_SERVER_URL = os.getenv("MCP_SERVER_URL", "http://127.0.0.1:8000").rstrip("/")
+
+AZURE_OPENAI_KEY = os.getenv("AZURE_OPENAI_KEY")
+AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
+AZURE_OPENAI_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
+AZURE_API_VERSION = os.getenv("AZURE_API_VERSION", "2024-12-01-preview")
+
+if not AZURE_OPENAI_KEY:
+    raise RuntimeError("❌ AZURE_OPENAI_KEY not set")
+
+client_azure = AzureOpenAI(
+    api_key=AZURE_OPENAI_KEY,
+    api_version=AZURE_API_VERSION,
+    azure_endpoint=AZURE_OPENAI_ENDPOINT
+)
+
+def _build_tool_prompt() -> str:
+    lines = []
+    for name, meta in TOOLS.items():
+        arg_str = ", ".join(meta["args"])
+        lines.append(f"- {name}({arg_str}): {meta['desc']}")
+    return "\n".join(lines)
+
+SYSTEM_PROMPT_PLAN = f"""
+You are an assistant that converts user questions into MCP tool calls.
+
+Available tools:
+{_build_tool_prompt()}
+
+Rules:
+- Aggregates → run_aggregated_query
+- Listings/filters → raw_mongodb_query
+- Single flight facts → dedicated tools
+- Always return JSON with top-level "plan".
+"""
+
+SYSTEM_PROMPT_SUMMARIZE = """
+Summarize tool outputs for a user. Be short, factual, bullet points are OK.
+"""
+
+class FlightOpsMCPClient:
+    def __init__(self, base_url: str = None):
+        self.base_url = (base_url or MCP_SERVER_URL).rstrip("/")
+        self.session: ClientSession | None = None
+        self._client_context = None
+
+    async def connect(self):
+        logger.info(f"Connecting to MCP server at {self.base_url}")
+        self._client_context = streamablehttp_client(self.base_url)
+        read_stream, write_stream, _ = await self._client_context.__aenter__()  # type: ignore
+        self.session = ClientSession(read_stream, write_stream)
+        await self.session.__aenter__()  # type: ignore
+        await self.session.initialize()
+        logger.info("✅ Connected to MCP server")
+
+    async def disconnect(self):
+        try:
+            if self.session:
+                await self.session.__aexit__(None, None, None)  # type: ignore
+            if self._client_context:
+                await self._client_context.__aexit__(None, None, None)  # type: ignore
+        except Exception as e:
+            logger.error(f"Disconnect error: {e}")
+
+    def _call_azure_openai(self, messages: list, temperature=0.2, max_tokens=1024) -> str:
+        try:
+            completion = client_azure.chat.completions.create(
+                model=AZURE_OPENAI_DEPLOYMENT,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+            return completion.choices[0].message.content
+        except Exception as e:
+            logger.error(f"Azure OpenAI error: {e}")
+            return ""
+
+    async def list_tools(self) -> dict:
+        if not self.session:
+            await self.connect()
+        tools_list = await self.session.list_tools()
+        tools_dict = {t.name: {"description": t.description, "inputSchema": t.inputSchema} for t in tools_list.tools}
+        return {"tools": tools_dict}
+
+    async def invoke_tool(self, tool_name: str, args: dict) -> dict:
+        if not self.session:
+            await self.connect()
+        logger.info(f"Calling tool {tool_name} args={args}")
+        result = await self.session.call_tool(tool_name, args)
+        if result.content:
+            items = []
+            for it in result.content:
+                if hasattr(it, "text"):
+                    try:
+                        items.append(json.loads(it.text))
+                    except json.JSONDecodeError:
+                        items.append(it.text)
+            return items[0] if len(items) == 1 else {"results": items}
+        return {"error": "No content"}
+
+    def plan_tools(self, user_query: str) -> dict:
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT_PLAN},
+            {"role": "user", "content": user_query},
+        ]
+        content = (self._call_azure_openai(messages, temperature=0.1) or "").strip()
+        cleaned = content
+        if cleaned.startswith("```"):
+            cleaned = cleaned.strip("`")
+            if cleaned.lower().startswith("json"):
+                cleaned = cleaned[4:].strip()
+            cleaned = cleaned.replace("```", "").strip()
+        try:
+            plan = json.loads(cleaned)
+            return plan if isinstance(plan, dict) and "plan" in plan else {"plan": []}
+        except json.JSONDecodeError:
+            logger.warning(f"Plan parse failed. Raw:\n{content}")
+            return {"plan": []}
+
+    def summarize_results(self, user_query: str, plan: list, results: list) -> dict:
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT_SUMMARIZE},
+            {"role": "user", "content": f"Question:\n{user_query}"},
+            {"role": "assistant", "content": f"Plan:\n{json.dumps(plan, indent=2)}"},
+            {"role": "assistant", "content": f"Results:\n{json.dumps(results, indent=2)}"},
+        ]
+        summary = self._call_azure_openai(messages, temperature=0.3)
+        return {"summary": summary or ""}
+####################################################
+  # tool_registry.py
+TOOLS = {
+    "get_flight_basic_info": {"args": ["carrier", "flight_number", "date_of_origin"], "desc": "Basic flight info"},
+    "get_operation_times": {"args": ["carrier", "flight_number", "date_of_origin"], "desc": "Operation times"},
+    "get_equipment_info": {"args": ["carrier", "flight_number", "date_of_origin"], "desc": "Equipment info"},
+    "get_delay_summary": {"args": ["carrier", "flight_number", "date_of_origin"], "desc": "Delay summary"},
+    "get_fuel_summary": {"args": ["carrier", "flight_number", "date_of_origin"], "desc": "Fuel summary"},
+    "get_passenger_info": {"args": ["carrier", "flight_number", "date_of_origin"], "desc": "Passenger info"},
+    "get_crew_info": {"args": ["carrier", "flight_number", "date_of_origin"], "desc": "Crew info"},
+    "raw_mongodb_query": {"args": ["query_json", "projection", "limit"], "desc": "Raw Mongo query"},
+    "run_aggregated_query": {"args": ["query_type", "carrier", "field", "start_date", "end_date", "filter_json"], "desc": "Aggregate query"}
+}
+############################################
+  # ag_ui_adapter.py
+import os, json, uuid, asyncio, logging
+from typing import AsyncGenerator
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+from dotenv import load_dotenv
+from client import FlightOpsMCPClient
+
+load_dotenv()
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+logger = logging.getLogger("AGUI.Adapter")
+
+app = FastAPI(title="FlightOps — AG-UI Adapter")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+mcp_client = FlightOpsMCPClient()
+
+def sse_event(data: dict) -> str:
+    return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+async def ensure_mcp_connected():
+    if not mcp_client.session:
+        await mcp_client.connect()
+
+@app.on_event("startup")
+async def startup_event():
+    try:
+        await ensure_mcp_connected()
+    except Exception as e:
+        logger.warning(f"MCP preconnect failed: {e}")
+
+@app.post("/agent")
+async def run_agent(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    messages = body.get("messages", [])
+    if not messages:
+        raise HTTPException(status_code=400, detail="Missing messages")
+
+    last = messages[-1]
+    user_query = last.get("content") if isinstance(last, dict) else str(last)
+    if not user_query:
+        raise HTTPException(status_code=400, detail="Empty user query")
+
+    thread_id = body.get("thread_id") or f"thread-{uuid.uuid4().hex[:8]}"
+    run_id = body.get("run_id") or f"run-{uuid.uuid4().hex[:8]}"
+
+    async def event_stream() -> AsyncGenerator[str, None]:
+        yield sse_event({"type": "RUN_STARTED", "thread_id": thread_id, "run_id": run_id})
+
+        try:
+            await ensure_mcp_connected()
+        except Exception as e:
+            yield sse_event({"type": "RUN_ERROR", "error": f"MCP connection failed: {e}"})
+            return
+
+        loop = asyncio.get_event_loop()
+
+        # Plan (in thread executor to avoid blocking event loop)
+        yield sse_event({"type": "TEXT_MESSAGE_CONTENT", "content": "Planning tool calls..."})
+        plan_obj = await loop.run_in_executor(None, mcp_client.plan_tools, user_query)
+        plan = plan_obj.get("plan", [])
+        yield sse_event({"type": "STATE_SNAPSHOT", "plan": plan})
+
+        if not plan:
+            yield sse_event({"type": "RUN_FINISHED", "reason": "NO_PLAN"})
+            return
+
+        # Execute tools
+        results = []
+        for idx, step in enumerate(plan):
+            tool_name = step.get("tool")
+            args = step.get("arguments", {}) or {}
+            # clean args
+            args = {k: v for k, v in args.items() if v and str(v).strip().lower() != "unknown"}
+            tool_call_id = f"toolcall-{uuid.uuid4().hex[:8]}"
+
+            yield sse_event({"type": "TOOL_CALL_START", "toolCallId": tool_call_id, "toolCallName": tool_name})
+            yield sse_event({"type": "TOOL_CALL_ARGS", "toolCallId": tool_call_id, "args": args})
+
+            try:
+                tool_result = await mcp_client.invoke_tool(tool_name, args)
+            except Exception as e:
+                tool_result = {"error": str(e)}
+
+            results.append({tool_name: tool_result})
+            yield sse_event({"type": "TOOL_CALL_RESULT", "toolCallId": tool_call_id, "result": tool_result})
+            yield sse_event({"type": "TOOL_CALL_END", "toolCallId": tool_call_id})
+
+        # Summarize (thread pool)
+        yield sse_event({"type": "TEXT_MESSAGE_CONTENT", "content": "Summarizing results..."})
+        summary = await loop.run_in_executor(None, mcp_client.summarize_results, user_query, plan, results)
+
+        yield sse_event({
+            "type": "TEXT_MESSAGE_CONTENT",
+            "role": "assistant",
+            "content": summary.get("summary", "")
+        })
+        yield sse_event({"type": "STATE_SNAPSHOT", "snapshot": {"plan": plan, "results": results, "summary": summary}})
+        yield sse_event({"type": "RUN_FINISHED", "run_id": run_id})
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
+#############################################################
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+python-dotenv==1.0.1
+motor==3.5.1
+pymongo==4.8.0
+mcp==0.1.2
+mcp[http]==0.1.2
+openai==1.51.0
+###############################################################
+# Mongo
+MONGO_URI=mongodb://localhost:27017
+MONGO_DB=flightops
+MONGO_COLLECTION=flights
+
+# MCP
+MCP_HOST=127.0.0.1
+MCP_PORT=8000
+MCP_TRANSPORT=streamable-http
+MCP_SERVER_URL=http://127.0.0.1:8000
+
+# Azure OpenAI
+AZURE_OPENAI_KEY=***
+AZURE_OPENAI_ENDPOINT=https://<your-resource>.openai.azure.com/
+AZURE_OPENAI_DEPLOYMENT=gpt-4o
+AZURE_API_VERSION=2024-12-01-preview
+
+LOG_LEVEL=INFO
+##############################
+  VITE_AGENT_ENDPOINT=http://localhost:8001/agent
+###############################################
+  <!doctype html>
+<html>
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+    <title>FlightOps UI</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>
+##############################################
+  import React from "react";
+import { createRoot } from "react-dom/client";
+import App from "./App.jsx";
+
+createRoot(document.getElementById("root")).render(<App />);
+##############################################
+import React, { useState } from "react";
+import EventStreamViewer from "./components/EventStreamViewer";
+
+const AG_AGENT_ENDPOINT = import.meta.env.VITE_AGENT_ENDPOINT || "http://localhost:8001/agent";
+
+export default function App() {
+  const [query, setQuery] = useState("");
+  const [events, setEvents] = useState([]);
+
+  function pushEvent(e) {
+    setEvents(prev => [...prev, e]);
+  }
+
+  async function startRun() {
+    if (!query.trim()) {
+      alert("Enter a question");
+      return;
+    }
+    setEvents([]);
+
+    const body = {
+      thread_id: "thread-" + Date.now(),
+      run_id: "run-" + Date.now(),
+      messages: [{ role: "user", content: query }],
+    };
+
+    const resp = await fetch(AG_AGENT_ENDPOINT, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+
+    if (!resp.ok) {
+      const txt = await resp.text();
+      pushEvent({ type: "ERROR", error: txt });
+      return;
+    }
+
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+
+      let idx;
+      while ((idx = buf.indexOf("\n\n")) !== -1) {
+        const chunk = buf.slice(0, idx);   // one SSE event
+        buf = buf.slice(idx + 2);
+        const lines = chunk.split("\n");
+        for (const line of lines) {
+          if (line.startsWith("data:")) {
+            const payload = line.slice(5).trim();
+            try {
+              pushEvent(JSON.parse(payload));
+            } catch {
+              pushEvent({ type: "RAW", raw: payload });
+            }
+          }
+        }
+      }
+    }
+  }
+
+  return (
+    <div style={{ padding: 18, fontFamily: "Inter, system-ui, Arial" }}>
+      <h1>✈️ FlightOps — AG-UI (SSE)</h1>
+      <p>Ask: “6E215 on 2024-06-23 ka delay summary?”</p>
+      <textarea
+        rows={4}
+        style={{ width: "100%", fontSize: 16 }}
+        value={query}
+        onChange={(e) => setQuery(e.target.value)}
+      />
+      <div style={{ marginTop: 8 }}>
+        <button onClick={startRun}>Ask</button>
+      </div>
+      <hr />
+      <EventStreamViewer events={events} />
+    </div>
+  );
+}
+
+##########################################################
+import React from "react";
+
+export default function EventStreamViewer({ events }) {
+  if (!events.length) return <p>No events yet.</p>;
+  const box = { background: "#f7f7f9", padding: 10, borderRadius: 8, marginBottom: 8 };
+
+  return (
+    <div>
+      {events.map((e, i) => (
+        <div style={box} key={i}>
+          <pre style={{ margin: 0, whiteSpace: "pre-wrap" }}>{JSON.stringify(e, null, 2)}</pre>
+        </div>
+      ))}
+    </div>
+  );
+}
