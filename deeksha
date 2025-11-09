@@ -1,3 +1,61 @@
+ERROR:FlightOps.MCPClient:Failed to connect to MCP server: Session terminated
+ERROR:    Traceback (most recent call last):
+  File "C:\Users\Deeksha.x.Srivastava\OneDrive - InterGlobe Aviation Limited\Desktop\new_mcp_ui\agui\Lib\site-packages\starlette\routing.py", line 694, in lifespan
+    async with self.lifespan_context(app) as maybe_state:
+               ~~~~~~~~~~~~~~~~~~~~~^^^^^
+  File "C:\Users\Deeksha.x.Srivastava\OneDrive - InterGlobe Aviation Limited\Desktop\new_mcp_ui\agui\Lib\site-packages\starlette\routing.py", line 571, in __aenter__
+    await self._router.startup()
+  File "C:\Users\Deeksha.x.Srivastava\OneDrive - InterGlobe Aviation Limited\Desktop\new_mcp_ui\agui\Lib\site-packages\starlette\routing.py", line 671, in startup
+    await handler()
+  File "C:\Users\Deeksha.x.Srivastava\OneDrive - InterGlobe Aviation Limited\Desktop\new_mcp_ui\backend\backend.py", line 52, in startup_event
+    await thread_manager.initialize_client()
+  File "C:\Users\Deeksha.x.Srivastava\OneDrive - InterGlobe Aviation Limited\Desktop\new_mcp_ui\backend\backend.py", line 41, in initialize_client
+    await self.mcp_client.connect()
+  File "C:\Users\Deeksha.x.Srivastava\OneDrive - InterGlobe Aviation Limited\Desktop\new_mcp_ui\backend\client.py", line 143, in connect
+    await self.session.initialize()
+  File "C:\Users\Deeksha.x.Srivastava\OneDrive - InterGlobe Aviation Limited\Desktop\new_mcp_ui\agui\Lib\site-packages\mcp\client\session.py", line 153, in initialize
+    result = await self.send_request(
+             ^^^^^^^^^^^^^^^^^^^^^^^^
+    ...<15 lines>...
+    )
+    ^
+  File "C:\Users\Deeksha.x.Srivastava\OneDrive - InterGlobe Aviation Limited\Desktop\new_mcp_ui\agui\Lib\site-packages\mcp\shared\session.py", line 286, in send_request
+    raise McpError(response_or_error.error)
+mcp.shared.exceptions.McpError: Session terminated
+
+ERROR:    Application startup failed. Exiting.
+ERROR:asyncio:an error occurred during closing of asynchronous generator <async_generator object streamablehttp_client at 0x0000028BF700E150>
+asyncgen: <async_generator object streamablehttp_client at 0x0000028BF700E150>
+  + Exception Group Traceback (most recent call last):
+  |   File "C:\Users\Deeksha.x.Srivastava\OneDrive - InterGlobe Aviation Limited\Desktop\new_mcp_ui\agui\Lib\site-packages\anyio\_backends\_asyncio.py", line 781, in __aexit__
+  |     raise BaseExceptionGroup(
+  |         "unhandled errors in a TaskGroup", self._exceptions
+  |     ) from None
+  | BaseExceptionGroup: unhandled errors in a TaskGroup (1 sub-exception)
+  +-+---------------- 1 ----------------
+    | Traceback (most recent call last):
+    |   File "C:\Users\Deeksha.x.Srivastava\OneDrive - InterGlobe Aviation Limited\Desktop\new_mcp_ui\agui\Lib\site-packages\mcp\client\streamable_http.py", line 502, in streamablehttp_client
+    |     yield (
+    |     ...<3 lines>...
+    |     )
+    | GeneratorExit
+    +------------------------------------
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "C:\Users\Deeksha.x.Srivastava\OneDrive - InterGlobe Aviation Limited\Desktop\new_mcp_ui\agui\Lib\site-packages\mcp\client\streamable_http.py", line 478, in streamablehttp_client
+    async with anyio.create_task_group() as tg:
+               ~~~~~~~~~~~~~~~~~~~~~~~^^
+  File "C:\Users\Deeksha.x.Srivastava\OneDrive - InterGlobe Aviation Limited\Desktop\new_mcp_ui\agui\Lib\site-packages\anyio\_backends\_asyncio.py", line 787, in __aexit__
+    if self.cancel_scope.__exit__(type(exc), exc, exc.__traceback__):
+       ~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Deeksha.x.Srivastava\OneDrive - InterGlobe Aviation Limited\Desktop\new_mcp_ui\agui\Lib\site-packages\anyio\_backends\_asyncio.py", line 459, in __exit__
+    raise RuntimeError(
+    ...<2 lines>...
+    )
+RuntimeError: Attempted to exit cancel scope in a different task than it was entered in
+##########################################
 import os
 import logging
 import json
