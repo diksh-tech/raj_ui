@@ -1,59 +1,19 @@
-sers\Deeksha.x.Srivastava\OneDrive - InterGlobe Aviation Limited\Desktop\new_mcp_ui\backend\backend.py:83: DeprecationWarning:
-        on_event is deprecated, use lifespan event handlers instead.
-
-        Read more about it in the
-        [FastAPI docs for Lifespan Events](https://fastapi.tiangolo.com/advanced/events/).
-
-  @app.on_event("startup")
-C:\Users\Deeksha.x.Srivastava\OneDrive - InterGlobe Aviation Limited\Desktop\new_mcp_ui\backend\backend.py:90: DeprecationWarning:
-        on_event is deprecated, use lifespan event handlers instead.
-
-        Read more about it in the
-        [FastAPI docs for Lifespan Events](https://fastapi.tiangolo.com/advanced/events/).
-
-  @app.on_event("shutdown")
-INFO:     Started server process [20496]
-INFO:     Waiting for application startup.
-INFO:FlightOps.Backend:Starting FlightOps AG-UI Backend...
-INFO:FlightOps.Backend:Backend started (MCP client will initialize on first request)
-INFO:     Application startup complete.
-INFO:     Uvicorn running on http://0.0.0.0:8001 (Press CTRL+C to quit)
-INFO:     127.0.0.1:58505 - "GET /agent HTTP/1.1" 405 Method Not Allowed
-
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
+from contextlib import asynccontextmanager
 import asyncio
 import json
 import uuid
 import logging
 from datetime import datetime
 from typing import Optional
-import time
 
 # Import your existing MCP client
 from client import FlightOpsMCPClient
 
-app = FastAPI(title="FlightOps AG-UI API", version="1.0.0")
-
-# CORS middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("FlightOps.Backend")
-
-class QueryRequest(BaseModel):
-    query: str
-    thread_id: Optional[str] = None
-    run_id: Optional[str] = None
-
+# Thread manager class
 class ThreadManager:
     def __init__(self):
         self.active_threads = {}
@@ -100,20 +60,44 @@ class ThreadManager:
             finally:
                 self.mcp_client = None
 
+# Global thread manager
 thread_manager = ThreadManager()
 
-@app.on_event("startup")
-async def startup_event():
-    """Initialize MCP client on startup with retry"""
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
     logger.info("Starting FlightOps AG-UI Backend...")
     # Don't initialize MCP client here - do it lazily on first request
     logger.info("Backend started (MCP client will initialize on first request)")
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    """Cleanup on shutdown"""
+    
+    yield  # This is where the application runs
+    
+    # Shutdown
     await thread_manager.close_client()
     logger.info("FlightOps AG-UI Backend stopped")
+
+app = FastAPI(
+    title="FlightOps AG-UI API", 
+    version="1.0.0",
+    lifespan=lifespan
+)
+
+# CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("FlightOps.Backend")
+
+class QueryRequest(BaseModel):
+    query: str
+    thread_id: Optional[str] = None
+    run_id: Optional[str] = None
 
 def format_sse_event(event_type: str, data: dict) -> str:
     """Format data as Server-Sent Event"""
@@ -265,12 +249,29 @@ async def execute_query_stream(query: str, thread_id: str, run_id: str):
 
 @app.post("/agent")
 async def agent_stream(request: QueryRequest):
-    """AG-UI compatible streaming endpoint"""
+    """AG-UI compatible streaming endpoint - POST method"""
     thread_id = request.thread_id or f"thread-{uuid.uuid4().hex[:8]}"
     run_id = request.run_id or f"run-{uuid.uuid4().hex[:8]}"
     
     return StreamingResponse(
         execute_query_stream(request.query, thread_id, run_id),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Headers": "*",
+        }
+    )
+
+@app.get("/agent")
+async def agent_stream_get(query: str, thread_id: Optional[str] = None, run_id: Optional[str] = None):
+    """AG-UI compatible streaming endpoint - GET method for EventSource"""
+    thread_id = thread_id or f"thread-{uuid.uuid4().hex[:8]}"
+    run_id = run_id or f"run-{uuid.uuid4().hex[:8]}"
+    
+    return StreamingResponse(
+        execute_query_stream(query, thread_id, run_id),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
@@ -318,316 +319,400 @@ async def list_tools():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8001, log_level="info")
-###################################################333
-import os
-import json
-import logging
-import asyncio
-from typing import List, Dict, Any
-import time
+################################################################3
+import React, { useState, useEffect, useRef } from "react";
+import EventStreamViewer from "./components/EventStreamViewer.jsx";
 
-from dotenv import load_dotenv
-from openai import AzureOpenAI
-from mcp import ClientSession, McpError
-from mcp.client.streamable_http import streamablehttp_client
+const AGENT_ENDPOINT = import.meta.env.VITE_AGENT_ENDPOINT || "http://localhost:8001/agent";
 
-# Load environment variables
-load_dotenv()
+export default function App() {
+  const [query, setQuery] = useState("");
+  const [events, setEvents] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [connectionStatus, setConnectionStatus] = useState("disconnected");
+  const eventSourceRef = useRef(null);
 
-MCP_SERVER_URL = os.getenv("MCP_SERVER_URL", "http://127.0.0.1:8000").rstrip("/")
+  function pushEvent(event) {
+    setEvents(prev => [...prev, event]);
+  }
 
-# Azure OpenAI configuration
-AZURE_OPENAI_KEY = os.getenv("AZURE_OPENAI_KEY")
-AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
-AZURE_OPENAI_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
-AZURE_API_VERSION = os.getenv("AZURE_API_VERSION", "2024-12-01-preview")
+  function clearEvents() {
+    setEvents([]);
+  }
 
-if not AZURE_OPENAI_KEY:
-    raise RuntimeError("❌ AZURE_OPENAI_KEY not set in environment")
-
-logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
-logger = logging.getLogger("FlightOps.MCPClient")
-
-# Initialize Azure OpenAI client
-client_azure = AzureOpenAI(
-    api_key=AZURE_OPENAI_KEY,
-    api_version=AZURE_API_VERSION,
-    azure_endpoint=AZURE_OPENAI_ENDPOINT
-)
-
-# Tool registry
-TOOLS = {
-    "get_flight_basic_info": {
-        "args": ["carrier", "flight_number", "date_of_origin"],
-        "desc": "Fetch basic flight information"
-    },
-    "get_operation_times": {
-        "args": ["carrier", "flight_number", "date_of_origin"],
-        "desc": "Get operation times and offsets"
-    },
-    "get_equipment_info": {
-        "args": ["carrier", "flight_number", "date_of_origin"],
-        "desc": "Get aircraft equipment details"
-    },
-    "get_delay_summary": {
-        "args": ["carrier", "flight_number", "date_of_origin"],
-        "desc": "Get delay information"
-    },
-    "get_fuel_summary": {
-        "args": ["carrier", "flight_number", "date_of_origin"],
-        "desc": "Get fuel information"
-    },
-    "get_passenger_info": {
-        "args": ["carrier", "flight_number", "date_of_origin"],
-        "desc": "Get passenger information"
-    },
-    "get_crew_info": {
-        "args": ["carrier", "flight_number", "date_of_origin"],
-        "desc": "Get crew information"
-    },
-    "raw_mongodb_query": {
-        "args": ["query_json", "projection", "limit"],
-        "desc": "Execute raw MongoDB query"
-    },
-    "run_aggregated_query": {
-        "args": ["query_type", "carrier", "field", "start_date", "end_date", "filter_json"],
-        "desc": "Run aggregation queries"
+  async function startRun() {
+    if (!query.trim()) {
+      alert("Please enter a question");
+      return;
     }
-}
 
-def _build_tool_prompt() -> str:
-    """Convert TOOLS dict into compact text to feed the LLM."""
-    lines = []
-    for name, meta in TOOLS.items():
-        arg_str = ", ".join(meta["args"])
-        lines.append(f"- {name}({arg_str}): {meta['desc']}")
-    return "\n".join(lines)
+    setLoading(true);
+    setConnectionStatus("connecting");
+    clearEvents();
 
-SYSTEM_PROMPT_PLAN = f"""
-You are an assistant that converts user questions into MCP tool calls.
+    const threadId = `thread-${Date.now()}`;
+    const runId = `run-${Date.now()}`;
 
-Available tools:
-{_build_tool_prompt()}
+    try {
+      // Using GET method for EventSource with query parameters
+      const params = new URLSearchParams({
+        query: query,
+        thread_id: threadId,
+        run_id: runId
+      });
+      
+      const url = `${AGENT_ENDPOINT}?${params}`;
+      
+      // Close any existing connection
+      if (eventSourceRef.current) {
+        eventSourceRef.current.close();
+      }
 
-### Tool selection logic
+      eventSourceRef.current = new EventSource(url, {
+        withCredentials: false
+      });
 
-1. **Use `run_aggregated_query`** when the user asks for:
-   - counts, numbers, totals, sums, averages, minimums, or maximums
-   - examples: "how many flights", "number of passengers", "average delay", "max flight time", "total fuel"
-   - In such cases:
-     - set `"query_type"` to one of ["count", "sum", "average", "min", "max"]
-     - set `"field"` to the appropriate MongoDB path (e.g. "flightLegState.pax.passengerCount.count")
-     - if the user gives a condition (e.g. "where delay > 30"), include it as `"filter_json"`
-     - optionally include `"start_date"` and `"end_date"` for time ranges
+      eventSourceRef.current.onopen = () => {
+        setConnectionStatus("connected");
+        console.log("SSE connection opened");
+      };
 
-2. **Use `raw_mongodb_query`** for:
-   - retrieving lists of flights, filtered data, or detailed fields
-   - when the question asks to "show", "list", "find", or "get" specific flight data
-   - supports `"projection"` to reduce payload (LLM decides what to include)
+      eventSourceRef.current.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data);
+          pushEvent(data);
+          
+          // Update connection status based on event type
+          if (data.type === "run_complete" || data.type === "error") {
+            setLoading(false);
+            setConnectionStatus("completed");
+            if (eventSourceRef.current) {
+              eventSourceRef.current.close();
+              eventSourceRef.current = null;
+            }
+          }
+        } catch (error) {
+          console.error("Error parsing SSE event:", error);
+        }
+      };
 
-3. **Use existing tools** (like get_flight_basic_info, get_delay_summary, etc.) for single-flight queries.
+      eventSourceRef.current.onerror = (error) => {
+        console.error("SSE error:", error);
+        setConnectionStatus("error");
+        setLoading(false);
+        
+        pushEvent({
+          type: "error",
+          data: {
+            message: "Connection error occurred. Please check if the backend server is running.",
+            timestamp: new Date().toISOString()
+          }
+        });
 
-### Schema summary
-Flight documents contain nested fields under 'flightLegState' including:
-- carrier, flightNumber, dateOfOrigin
-- startStation, endStation, scheduledStartTime, scheduledEndTime
-- operation.estimatedTimes, operation.actualTimes, operation.fuel
-- delays, pax, crewConnections, equipment
+        if (eventSourceRef.current) {
+          eventSourceRef.current.close();
+          eventSourceRef.current = null;
+        }
+      };
 
-### Rules
-1. Always return valid JSON with a top-level "plan" key.
-2. Use the correct tool type based on query intent.
-3. Never invent field names — use schema fields only.
-4. For numerical summaries → use run_aggregated_query.
-5. For filtered listings → use raw_mongodb_query.
-6. Latest date in the database is 2025-05-30 (consider it today's date)
-"""
+    } catch (error) {
+      console.error("Failed to start run:", error);
+      setConnectionStatus("error");
+      setLoading(false);
+      
+      pushEvent({
+        type: "error", 
+        data: {
+          message: `Failed to start: ${error.message}`,
+          timestamp: new Date().toISOString()
+        }
+      });
+    }
+  }
 
-SYSTEM_PROMPT_SUMMARIZE = """
-You are an assistant that summarizes tool outputs into a concise, readable answer.
-Be factual, short, bullet points format and helpful. 
-Focus on the key insights from the data.
-"""
+  function stopRun() {
+    if (eventSourceRef.current) {
+      eventSourceRef.current.close();
+      eventSourceRef.current = null;
+    }
+    setLoading(false);
+    setConnectionStatus("disconnected");
+    
+    pushEvent({
+      type: "run_stopped",
+      data: {
+        message: "Run stopped by user",
+        timestamp: new Date().toISOString()
+      }
+    });
+  }
 
-class FlightOpsMCPClient:
-    def __init__(self, base_url: str = None):
-        self.base_url = (base_url or MCP_SERVER_URL).rstrip("/")
-        self.session: ClientSession = None
-        self._client_context = None
-        self.connected = False
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => {
+      if (eventSourceRef.current) {
+        eventSourceRef.current.close();
+      }
+    };
+  }, []);
 
-    async def connect(self, max_retries: int = 3, retry_delay: float = 2.0):
-        """Connect to MCP server with retry logic"""
-        for attempt in range(max_retries):
-            try:
-                logger.info(f"Connecting to MCP server at {self.base_url} (attempt {attempt + 1}/{max_retries})")
-                self._client_context = streamablehttp_client(self.base_url)
-                read_stream, write_stream, _ = await self._client_context.__aenter__()
-                self.session = ClientSession(read_stream, write_stream)
-                await self.session.__aenter__()
-                await self.session.initialize()
-                self.connected = True
-                logger.info("✅ Connected to MCP server successfully")
-                return
-            except Exception as e:
-                logger.error(f"❌ Connection attempt {attempt + 1} failed: {str(e)}")
-                if attempt < max_retries - 1:
-                    logger.info(f"Retrying in {retry_delay} seconds...")
-                    await asyncio.sleep(retry_delay)
-                else:
-                    self.connected = False
-                    raise Exception(f"Failed to connect to MCP server after {max_retries} attempts: {str(e)}")
+  const exampleQueries = [
+    "Show me all flights from Delhi to Mumbai yesterday",
+    "What was the average delay for flight 6E-215?",
+    "How many passengers were on flight AI-101 on 2024-06-23?",
+    "List all flights with delays greater than 30 minutes",
+    "What is the fuel consumption for flight 6E-215?",
+    "Show crew information for flight AI-101",
+    "Find flights that were cancelled last week",
+    "What is the on-time performance for flight 6E-215?"
+  ];
 
-    async def disconnect(self):
-        """Disconnect from MCP server"""
-        try:
-            if self.session:
-                await self.session.__aexit__(None, None, None)
-            if self._client_context:
-                await self._client_context.__aexit__(None, None, None)
-            self.connected = False
-            logger.info("Disconnected from MCP server")
-        except Exception as e:
-            logger.error(f"Error during disconnect: {e}")
-            self.connected = False
+  const handleExampleClick = (exampleQuery) => {
+    setQuery(exampleQuery);
+  };
 
-    def is_connected(self):
-        """Check if client is connected"""
-        return self.connected
+  const connectionStatusColors = {
+    disconnected: "#6b7280",
+    connecting: "#f59e0b",
+    connected: "#10b981",
+    error: "#ef4444",
+    completed: "#3b82f6"
+  };
 
-    # -------------------- AZURE OPENAI WRAPPER -------------------------
-    def _call_azure_openai(self, messages: list, temperature: float = 0.2, max_tokens: int = 2048) -> str:
-        try:
-            completion = client_azure.chat.completions.create(
-                model=AZURE_OPENAI_DEPLOYMENT,
-                messages=messages,
-                temperature=temperature,
-                max_tokens=max_tokens,
-            )
-            return completion.choices[0].message.content
-        except Exception as e:
-            logger.error(f"Azure OpenAI API error: {e}")
-            return json.dumps({"error": str(e)})
+  return (
+    <div style={{ 
+      padding: 20, 
+      fontFamily: "Inter, sans-serif", 
+      maxWidth: 1200, 
+      margin: '0 auto',
+      backgroundColor: '#f8fafc',
+      minHeight: '100vh'
+    }}>
+      {/* Header */}
+      <div style={{ 
+        background: 'white', 
+        padding: 24, 
+        borderRadius: 12, 
+        boxShadow: '0 4px 6px -1px rgba(0,0,0,0.1)',
+        marginBottom: 24
+      }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 16 }}>
+          <div>
+            <h1 style={{ 
+              margin: 0, 
+              color: '#1e293b',
+              display: 'flex',
+              alignItems: 'center',
+              gap: 12
+            }}>
+              <span style={{ fontSize: '1.5em' }}>✈️</span>
+              FlightOps — AG-UI Client
+            </h1>
+            <p style={{ 
+              margin: '8px 0 0 0', 
+              color: '#64748b',
+              fontSize: 16
+            }}>
+              Ask flight operations questions and watch real-time execution
+            </p>
+          </div>
+          
+          <div style={{ 
+            display: 'flex', 
+            alignItems: 'center', 
+            gap: 12,
+            background: '#f1f5f9',
+            padding: '8px 16px',
+            borderRadius: 8
+          }}>
+            <div style={{
+              width: 8,
+              height: 8,
+              borderRadius: '50%',
+              backgroundColor: connectionStatusColors[connectionStatus],
+              animation: connectionStatus === 'connecting' ? 'pulse 1.5s infinite' : 'none'
+            }} />
+            <span style={{ 
+              fontSize: 14, 
+              color: '#475569',
+              textTransform: 'capitalize'
+            }}>
+              {connectionStatus}
+            </span>
+          </div>
+        </div>
+      </div>
 
-    # -------------------- MCP TOOL CALLS -------------------------
-    async def list_tools(self) -> dict:
-        try:
-            if not self.connected:
-                await self.connect()
-            tools_list = await self.session.list_tools()
-            tools_dict = {tool.name: {"description": tool.description, "inputSchema": tool.inputSchema} for tool in tools_list.tools}
-            return {"tools": tools_dict}
-        except Exception as e:
-            logger.error(f"Error listing tools: {e}")
-            return {"error": str(e)}
-
-    async def invoke_tool(self, tool_name: str, args: dict) -> dict:
-        try:
-            if not self.connected:
-                await self.connect()
-            logger.info(f"Calling tool: {tool_name} with args: {args}")
-            result = await self.session.call_tool(tool_name, args)  
-
-            if result.content:
-                content_items = []
-                for item in result.content:
-                    if hasattr(item, 'text'):
-                        try:
-                            content_items.append(json.loads(item.text))
-                        except json.JSONDecodeError:
-                            content_items.append(item.text)
-                if len(content_items) == 1:
-                    return content_items[0]
-                return {"results": content_items}
-
-            return {"error": "No content in response"}
-        except Exception as e:
-            logger.error(f"Error invoking tool {tool_name}: {e}")
-            return {"error": str(e)}
-
-    # -------------------- LLM PLANNING & SUMMARIZATION -------------------------
-    def plan_tools(self, user_query: str) -> dict:
-        """Ask the LLM to produce a valid JSON plan for which MCP tools to call."""
-        messages = [
-            {"role": "system", "content": SYSTEM_PROMPT_PLAN},
-            {"role": "user", "content": user_query},
-        ]
-
-        content = self._call_azure_openai(messages, temperature=0.1)
-        if not content:
-            logger.warning("⚠️ LLM returned empty response during plan generation.")
-            return {"plan": []}
-
-        cleaned = content.strip()
-        if cleaned.startswith("```"):
-            cleaned = cleaned.strip("`")
-            if cleaned.lower().startswith("json"):
-                cleaned = cleaned[4:].strip()
-            cleaned = cleaned.replace("```", "").strip()
-
-        if cleaned != content:
-            logger.debug(f"🔍 Cleaned LLM plan output:\n{cleaned}")
-
-        try:
-            plan = json.loads(cleaned)
-            if isinstance(plan, dict) and "plan" in plan:
-                return plan
-            else:
-                logger.warning("⚠️ LLM output did not contain 'plan' key.")
-                return {"plan": []}
-        except json.JSONDecodeError:
-            logger.warning(f"❌ Could not parse LLM plan output after cleaning:\n{cleaned}")
-            return {"plan": []}
-
-    def summarize_results(self, user_query: str, plan: list, results: list) -> dict:
-        messages = [
-            {"role": "system", "content": SYSTEM_PROMPT_SUMMARIZE},
-            {"role": "user", "content": f"Question:\n{user_query}"},
-            {"role": "assistant", "content": f"Plan:\n{json.dumps(plan, indent=2)}"},
-            {"role": "assistant", "content": f"Results:\n{json.dumps(results, indent=2)}"},
-        ]
-        summary = self._call_azure_openai(messages, temperature=0.3)
-        return {"summary": summary}
-
-    async def run_query(self, user_query: str) -> dict:
-        """Full flow: Plan -> Execute -> Summarize"""
-        try:
-            logger.info(f"User query: {user_query}")
+      <div style={{ display: 'grid', gap: 24, gridTemplateColumns: '1fr 1fr' }}>
+        {/* Left Column - Input and Examples */}
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 24 }}>
+          {/* Query Input */}
+          <div style={{ 
+            background: 'white', 
+            padding: 24, 
+            borderRadius: 12, 
+            boxShadow: '0 4px 6px -1px rgba(0,0,0,0.1)'
+          }}>
+            <h3 style={{ margin: '0 0 16px 0', color: '#1e293b' }}>Ask a Question</h3>
+            <textarea
+              rows={5}
+              style={{ 
+                width: "100%", 
+                fontSize: 16, 
+                padding: 16,
+                border: '2px solid #e2e8f0',
+                borderRadius: 8,
+                fontFamily: 'inherit',
+                resize: 'vertical',
+                outline: 'none',
+                transition: 'border-color 0.2s'
+              }}
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              placeholder="Why was flight 6E215 delayed on June 23, 2024? 🛫"
+              disabled={loading}
+              onFocus={(e) => e.target.style.borderColor = '#3b82f6'}
+              onBlur={(e) => e.target.style.borderColor = '#e2e8f0'}
+            />
             
-            # Ensure we're connected
-            if not self.connected:
-                await self.connect()
+            <div style={{ 
+              display: 'flex', 
+              gap: 12, 
+              marginTop: 16,
+              flexWrap: 'wrap'
+            }}>
+              <button 
+                onClick={startRun}
+                disabled={loading || !query.trim()}
+                style={{
+                  padding: '12px 24px',
+                  background: loading ? '#9ca3af' : '#3b82f6',
+                  color: 'white',
+                  border: 'none',
+                  borderRadius: 8,
+                  cursor: loading ? 'not-allowed' : 'pointer',
+                  fontSize: 14,
+                  fontWeight: 600,
+                  transition: 'all 0.2s',
+                  opacity: loading || !query.trim() ? 0.6 : 1
+                }}
+              >
+                {loading ? (
+                  <span style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                    <div style={{ 
+                      width: 16, 
+                      height: 16, 
+                      border: '2px solid transparent',
+                      borderTop: '2px solid white',
+                      borderRadius: '50%',
+                      animation: 'spin 1s linear infinite'
+                    }} />
+                    Processing...
+                  </span>
+                ) : (
+                  '🚀 Run Query'
+                )}
+              </button>
+              
+              {loading && (
+                <button 
+                  onClick={stopRun}
+                  style={{
+                    padding: '12px 24px',
+                    background: '#ef4444',
+                    color: 'white',
+                    border: 'none',
+                    borderRadius: 8,
+                    cursor: 'pointer',
+                    fontSize: 14,
+                    fontWeight: 600
+                  }}
+                >
+                  ⏹️ Stop
+                </button>
+              )}
+              
+              <button 
+                onClick={clearEvents}
+                style={{
+                  padding: '12px 24px',
+                  background: '#6b7280',
+                  color: 'white',
+                  border: 'none',
+                  borderRadius: 8,
+                  cursor: 'pointer',
+                  fontSize: 14,
+                  fontWeight: 600
+                }}
+              >
+                🗑️ Clear
+              </button>
+            </div>
+          </div>
 
-            plan_data = self.plan_tools(user_query)
-            plan = plan_data.get("plan", [])
-            if not plan:
-                return {"error": "LLM did not produce a valid tool plan."}
+          {/* Example Queries */}
+          <div style={{ 
+            background: 'white', 
+            padding: 24, 
+            borderRadius: 12, 
+            boxShadow: '0 4px 6px -1px rgba(0,0,0,0.1)'
+          }}>
+            <h3 style={{ margin: '0 0 16px 0', color: '#1e293b' }}>Example Queries</h3>
+            <div style={{ display: 'grid', gap: 12 }}>
+              {exampleQueries.map((example, index) => (
+                <button
+                  key={index}
+                  onClick={() => handleExampleClick(example)}
+                  disabled={loading}
+                  style={{
+                    background: '#f8fafc',
+                    color: '#374151',
+                    border: '1px solid #e2e8f0',
+                    textAlign: 'left',
+                    padding: 16,
+                    fontSize: 14,
+                    borderRadius: 8,
+                    cursor: loading ? 'not-allowed' : 'pointer',
+                    fontFamily: 'inherit',
+                    transition: 'all 0.2s',
+                    opacity: loading ? 0.6 : 1
+                  }}
+                >
+                  {example}
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
 
-            results = []
-            for step in plan:
-                tool = step.get("tool")
-                args = step.get("arguments", {})
+        {/* Right Column - Event Stream */}
+        <div style={{ 
+          background: 'white', 
+          borderRadius: 12, 
+          boxShadow: '0 4px 6px -1px rgba(0,0,0,0.1)',
+          display: 'flex',
+          flexDirection: 'column',
+          height: '80vh'
+        }}>
+          <EventStreamViewer events={events} />
+        </div>
+      </div>
 
-                # Clean up bad args
-                args = {k: v for k, v in args.items() if v and str(v).strip().lower() != "unknown"}
+      <style>{`
+        @keyframes spin {
+          0% { transform: rotate(0deg); }
+          100% { transform: rotate(360deg); }
+        }
+        @keyframes pulse {
+          0%, 100% { opacity: 1; }
+          50% { opacity: 0.5; }
+        }
+      `}</style>
+    </div>
+  );
+}
+########################################
 
-                # Safety for MongoDB query
-                if tool == "raw_mongodb_query":
-                    query_json = args.get("query_json", "")
-                    if not query_json:
-                        results.append({"raw_mongodb_query": {"error": "Empty query_json"}})
-                        continue
-                    args["limit"] = int(args.get("limit", 50))
-                    logger.info(f"Executing raw MongoDB query: {query_json}")
-
-                resp = await self.invoke_tool(tool, args)
-                results.append({tool: resp})
-
-            summary = self.summarize_results(user_query, plan, results)
-            return {"plan": plan, "results": results, "summary": summary}
-        except Exception as e:
-            logger.error(f"Error in run_query: {e}")
-            return {"error": str(e)}
 #####################################################
 import React, { useState, useEffect, useRef } from "react";
 import EventStreamViewer from "./components/EventStreamViewer.jsx";
