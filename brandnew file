@@ -1,3 +1,1064 @@
+import os
+import json
+import logging
+import asyncio
+from typing import Dict, Any, List, Optional
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
+import uuid
+from datetime import datetime
+
+# Import your existing MCP client
+from app import FlightOpsMCPClient
+
+app = FastAPI(title="FlightOps AG-UI API", version="1.0.0")
+
+# CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("FlightOps.Backend")
+
+class QueryRequest(BaseModel):
+    query: str
+    thread_id: Optional[str] = None
+    run_id: Optional[str] = None
+
+class ThreadManager:
+    def __init__(self):
+        self.active_threads: Dict[str, Any] = {}
+        self.mcp_client = None
+    
+    async def initialize_client(self):
+        if self.mcp_client is None:
+            self.mcp_client = FlightOpsMCPClient()
+            await self.mcp_client.connect()
+    
+    async def close_client(self):
+        if self.mcp_client:
+            await self.mcp_client.disconnect()
+
+thread_manager = ThreadManager()
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialize MCP client on startup"""
+    await thread_manager.initialize_client()
+    logger.info("FlightOps AG-UI Backend started")
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Cleanup on shutdown"""
+    await thread_manager.close_client()
+    logger.info("FlightOps AG-UI Backend stopped")
+
+def format_sse_event(event_type: str, data: Dict[str, Any]) -> str:
+    """Format data as Server-Sent Event"""
+    event_data = {
+        "type": event_type,
+        "data": data,
+        "timestamp": datetime.now().isoformat()
+    }
+    return f"data: {json.dumps(event_data)}\n\n"
+
+async def execute_query_stream(query: str, thread_id: str, run_id: str):
+    """Execute query and stream events as SSE"""
+    try:
+        # Start event
+        yield format_sse_event("run_start", {
+            "thread_id": thread_id,
+            "run_id": run_id,
+            "query": query
+        })
+
+        # Plan generation event
+        yield format_sse_event("plan_generation", {
+            "status": "started",
+            "message": "Generating execution plan..."
+        })
+
+        # Generate plan
+        plan_data = thread_manager.mcp_client.plan_tools(query)
+        plan = plan_data.get("plan", [])
+        
+        yield format_sse_event("plan_generation", {
+            "status": "completed",
+            "plan": plan,
+            "message": f"Generated plan with {len(plan)} steps"
+        })
+
+        if not plan:
+            yield format_sse_event("error", {
+                "message": "No execution plan generated"
+            })
+            return
+
+        results = []
+        
+        # Execute each tool in the plan
+        for step_index, step in enumerate(plan):
+            tool = step.get("tool")
+            args = step.get("arguments", {})
+            
+            # Tool start event
+            yield format_sse_event("tool_start", {
+                "step": step_index + 1,
+                "total_steps": len(plan),
+                "tool": tool,
+                "args": args
+            })
+
+            try:
+                # Clean arguments
+                args = {k: v for k, v in args.items() if v and str(v).strip().lower() != "unknown"}
+                
+                # Safety for MongoDB query
+                if tool == "raw_mongodb_query":
+                    query_json = args.get("query_json", "")
+                    if not query_json:
+                        result = {"error": "Empty query_json"}
+                    else:
+                        args["limit"] = int(args.get("limit", 50))
+                        result = await thread_manager.mcp_client.invoke_tool(tool, args)
+                else:
+                    result = await thread_manager.mcp_client.invoke_tool(tool, args)
+                
+                results.append({tool: result})
+                
+                # Tool result event
+                yield format_sse_event("tool_result", {
+                    "step": step_index + 1,
+                    "tool": tool,
+                    "result": result,
+                    "status": "completed"
+                })
+                
+            except Exception as e:
+                error_result = {"error": str(e)}
+                results.append({tool: error_result})
+                
+                yield format_sse_event("tool_error", {
+                    "step": step_index + 1,
+                    "tool": tool,
+                    "error": str(e)
+                })
+
+        # Generate summary
+        yield format_sse_event("summary_generation", {
+            "status": "started",
+            "message": "Generating summary..."
+        })
+
+        try:
+            summary = thread_manager.mcp_client.summarize_results(query, plan, results)
+            
+            yield format_sse_event("summary_generation", {
+                "status": "completed",
+                "summary": summary
+            })
+            
+        except Exception as e:
+            yield format_sse_event("summary_error", {
+                "error": f"Summary generation failed: {str(e)}"
+            })
+
+        # Final result event
+        yield format_sse_event("run_complete", {
+            "thread_id": thread_id,
+            "run_id": run_id,
+            "plan": plan,
+            "results": results,
+            "summary": summary if 'summary' in locals() else None
+        })
+
+    except Exception as e:
+        logger.error(f"Query execution failed: {str(e)}")
+        yield format_sse_event("error", {
+            "message": f"Query execution failed: {str(e)}"
+        })
+
+@app.post("/agent")
+async def agent_stream(request: QueryRequest):
+    """AG-UI compatible streaming endpoint"""
+    thread_id = request.thread_id or f"thread-{uuid.uuid4().hex[:8]}"
+    run_id = request.run_id or f"run-{uuid.uuid4().hex[:8]}"
+    
+    return StreamingResponse(
+        execute_query_stream(request.query, thread_id, run_id),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Headers": "*",
+        }
+    )
+
+@app.post("/api/query")
+async def query_non_streaming(request: QueryRequest):
+    """Non-streaming endpoint for compatibility"""
+    try:
+        result = await thread_manager.mcp_client.run_query(request.query)
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    return {
+        "status": "healthy", 
+        "service": "FlightOps AG-UI Backend",
+        "timestamp": datetime.now().isoformat()
+    }
+
+@app.get("/tools")
+async def list_tools():
+    """List available tools"""
+    try:
+        tools = await thread_manager.mcp_client.list_tools()
+        return tools
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8001, log_level="info")
+####################################################################
+import React, { useState, useEffect, useRef } from "react";
+import EventStreamViewer from "./components/EventStreamViewer.jsx";
+
+const AGENT_ENDPOINT = import.meta.env.VITE_AGENT_ENDPOINT || "http://localhost:8001/agent";
+
+export default function App() {
+  const [query, setQuery] = useState("");
+  const [events, setEvents] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [connectionStatus, setConnectionStatus] = useState("disconnected");
+  const eventSourceRef = useRef(null);
+
+  function pushEvent(event) {
+    setEvents(prev => [...prev, event]);
+  }
+
+  function clearEvents() {
+    setEvents([]);
+  }
+
+  async function startRun() {
+    if (!query.trim()) {
+      alert("Please enter a question");
+      return;
+    }
+
+    setLoading(true);
+    setConnectionStatus("connecting");
+    clearEvents();
+
+    const threadId = `thread-${Date.now()}`;
+    const runId = `run-${Date.now()}`;
+
+    try {
+      // Using EventSource for SSE
+      const url = `${AGENT_ENDPOINT}?${new URLSearchParams({
+        thread_id: threadId,
+        run_id: runId
+      })}`;
+
+      eventSourceRef.current = new EventSource(url, {
+        withCredentials: false
+      });
+
+      eventSourceRef.current.onopen = () => {
+        setConnectionStatus("connected");
+        console.log("SSE connection opened");
+      };
+
+      eventSourceRef.current.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data);
+          pushEvent(data);
+          
+          // Update connection status based on event type
+          if (data.type === "run_complete" || data.type === "error") {
+            setLoading(false);
+            setConnectionStatus("completed");
+            if (eventSourceRef.current) {
+              eventSourceRef.current.close();
+            }
+          }
+        } catch (error) {
+          console.error("Error parsing SSE event:", error);
+        }
+      };
+
+      eventSourceRef.current.onerror = (error) => {
+        console.error("SSE error:", error);
+        setConnectionStatus("error");
+        setLoading(false);
+        
+        pushEvent({
+          type: "error",
+          data: {
+            message: "Connection error occurred",
+            timestamp: new Date().toISOString()
+          }
+        });
+
+        if (eventSourceRef.current) {
+          eventSourceRef.current.close();
+        }
+      };
+
+      // Send the initial request
+      const response = await fetch(AGENT_ENDPOINT, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          query: query,
+          thread_id: threadId,
+          run_id: runId
+        })
+      });
+
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}: ${await response.text()}`);
+      }
+
+    } catch (error) {
+      console.error("Failed to start run:", error);
+      setConnectionStatus("error");
+      setLoading(false);
+      
+      pushEvent({
+        type: "error", 
+        data: {
+          message: `Failed to start: ${error.message}`,
+          timestamp: new Date().toISOString()
+        }
+      });
+    }
+  }
+
+  function stopRun() {
+    if (eventSourceRef.current) {
+      eventSourceRef.current.close();
+      eventSourceRef.current = null;
+    }
+    setLoading(false);
+    setConnectionStatus("disconnected");
+    
+    pushEvent({
+      type: "run_stopped",
+      data: {
+        message: "Run stopped by user",
+        timestamp: new Date().toISOString()
+      }
+    });
+  }
+
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => {
+      if (eventSourceRef.current) {
+        eventSourceRef.current.close();
+      }
+    };
+  }, []);
+
+  const exampleQueries = [
+    "Show me all flights from Delhi to Mumbai yesterday",
+    "What was the average delay for flight 6E-215?",
+    "How many passengers were on flight AI-101 on 2024-06-23?",
+    "List all flights with delays greater than 30 minutes",
+    "What is the fuel consumption for flight 6E-215?",
+    "Show crew information for flight AI-101",
+    "Find flights that were cancelled last week",
+    "What is the on-time performance for flight 6E-215?"
+  ];
+
+  const handleExampleClick = (exampleQuery) => {
+    setQuery(exampleQuery);
+  };
+
+  const connectionStatusColors = {
+    disconnected: "#6b7280",
+    connecting: "#f59e0b",
+    connected: "#10b981",
+    error: "#ef4444",
+    completed: "#3b82f6"
+  };
+
+  return (
+    <div style={{ 
+      padding: 20, 
+      fontFamily: "Inter, sans-serif", 
+      maxWidth: 1200, 
+      margin: '0 auto',
+      backgroundColor: '#f8fafc',
+      minHeight: '100vh'
+    }}>
+      {/* Header */}
+      <div style={{ 
+        background: 'white', 
+        padding: 24, 
+        borderRadius: 12, 
+        boxShadow: '0 4px 6px -1px rgba(0,0,0,0.1)',
+        marginBottom: 24
+      }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 16 }}>
+          <div>
+            <h1 style={{ 
+              margin: 0, 
+              color: '#1e293b',
+              display: 'flex',
+              alignItems: 'center',
+              gap: 12
+            }}>
+              <span style={{ fontSize: '1.5em' }}>✈️</span>
+              FlightOps — AG-UI Client
+            </h1>
+            <p style={{ 
+              margin: '8px 0 0 0', 
+              color: '#64748b',
+              fontSize: 16
+            }}>
+              Ask flight operations questions and watch real-time execution
+            </p>
+          </div>
+          
+          <div style={{ 
+            display: 'flex', 
+            alignItems: 'center', 
+            gap: 12,
+            background: '#f1f5f9',
+            padding: '8px 16px',
+            borderRadius: 8
+          }}>
+            <div style={{
+              width: 8,
+              height: 8,
+              borderRadius: '50%',
+              backgroundColor: connectionStatusColors[connectionStatus],
+              animation: connectionStatus === 'connecting' ? 'pulse 1.5s infinite' : 'none'
+            }} />
+            <span style={{ 
+              fontSize: 14, 
+              color: '#475569',
+              textTransform: 'capitalize'
+            }}>
+              {connectionStatus}
+            </span>
+          </div>
+        </div>
+      </div>
+
+      <div style={{ display: 'grid', gap: 24, gridTemplateColumns: '1fr 1fr' }}>
+        {/* Left Column - Input and Examples */}
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 24 }}>
+          {/* Query Input */}
+          <div style={{ 
+            background: 'white', 
+            padding: 24, 
+            borderRadius: 12, 
+            boxShadow: '0 4px 6px -1px rgba(0,0,0,0.1)'
+          }}>
+            <h3 style={{ margin: '0 0 16px 0', color: '#1e293b' }}>Ask a Question</h3>
+            <textarea
+              rows={5}
+              style={{ 
+                width: "100%", 
+                fontSize: 16, 
+                padding: 16,
+                border: '2px solid #e2e8f0',
+                borderRadius: 8,
+                fontFamily: 'inherit',
+                resize: 'vertical',
+                outline: 'none',
+                transition: 'border-color 0.2s'
+              }}
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              placeholder="Why was flight 6E215 delayed on June 23, 2024? 🛫"
+              disabled={loading}
+              onFocus={(e) => e.target.style.borderColor = '#3b82f6'}
+              onBlur={(e) => e.target.style.borderColor = '#e2e8f0'}
+            />
+            
+            <div style={{ 
+              display: 'flex', 
+              gap: 12, 
+              marginTop: 16,
+              flexWrap: 'wrap'
+            }}>
+              <button 
+                onClick={startRun}
+                disabled={loading || !query.trim()}
+                style={{
+                  padding: '12px 24px',
+                  background: loading ? '#9ca3af' : '#3b82f6',
+                  color: 'white',
+                  border: 'none',
+                  borderRadius: 8,
+                  cursor: loading ? 'not-allowed' : 'pointer',
+                  fontSize: 14,
+                  fontWeight: 600,
+                  transition: 'all 0.2s',
+                  opacity: loading || !query.trim() ? 0.6 : 1
+                }}
+                onMouseOver={(e) => {
+                  if (!loading && query.trim()) {
+                    e.target.style.transform = 'translateY(-1px)';
+                    e.target.style.boxShadow = '0 4px 12px rgba(59, 130, 246, 0.4)';
+                  }
+                }}
+                onMouseOut={(e) => {
+                  e.target.style.transform = 'translateY(0)';
+                  e.target.style.boxShadow = 'none';
+                }}
+              >
+                {loading ? (
+                  <span style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                    <div style={{ 
+                      width: 16, 
+                      height: 16, 
+                      border: '2px solid transparent',
+                      borderTop: '2px solid white',
+                      borderRadius: '50%',
+                      animation: 'spin 1s linear infinite'
+                    }} />
+                    Processing...
+                  </span>
+                ) : (
+                  '🚀 Run Query'
+                )}
+              </button>
+              
+              {loading && (
+                <button 
+                  onClick={stopRun}
+                  style={{
+                    padding: '12px 24px',
+                    background: '#ef4444',
+                    color: 'white',
+                    border: 'none',
+                    borderRadius: 8,
+                    cursor: 'pointer',
+                    fontSize: 14,
+                    fontWeight: 600
+                  }}
+                >
+                  ⏹️ Stop
+                </button>
+              )}
+              
+              <button 
+                onClick={clearEvents}
+                style={{
+                  padding: '12px 24px',
+                  background: '#6b7280',
+                  color: 'white',
+                  border: 'none',
+                  borderRadius: 8,
+                  cursor: 'pointer',
+                  fontSize: 14,
+                  fontWeight: 600
+                }}
+              >
+                🗑️ Clear
+              </button>
+            </div>
+          </div>
+
+          {/* Example Queries */}
+          <div style={{ 
+            background: 'white', 
+            padding: 24, 
+            borderRadius: 12, 
+            boxShadow: '0 4px 6px -1px rgba(0,0,0,0.1)'
+          }}>
+            <h3 style={{ margin: '0 0 16px 0', color: '#1e293b' }}>Example Queries</h3>
+            <div style={{ display: 'grid', gap: 12 }}>
+              {exampleQueries.map((example, index) => (
+                <button
+                  key={index}
+                  onClick={() => handleExampleClick(example)}
+                  disabled={loading}
+                  style={{
+                    background: '#f8fafc',
+                    color: '#374151',
+                    border: '1px solid #e2e8f0',
+                    textAlign: 'left',
+                    padding: 16,
+                    fontSize: 14,
+                    borderRadius: 8,
+                    cursor: loading ? 'not-allowed' : 'pointer',
+                    fontFamily: 'inherit',
+                    transition: 'all 0.2s',
+                    opacity: loading ? 0.6 : 1
+                  }}
+                  onMouseOver={(e) => {
+                    if (!loading) {
+                      e.target.style.background = '#f1f5f9';
+                      e.target.style.borderColor = '#3b82f6';
+                    }
+                  }}
+                  onMouseOut={(e) => {
+                    if (!loading) {
+                      e.target.style.background = '#f8fafc';
+                      e.target.style.borderColor = '#e2e8f0';
+                    }
+                  }}
+                >
+                  {example}
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+
+        {/* Right Column - Event Stream */}
+        <div style={{ 
+          background: 'white', 
+          borderRadius: 12, 
+          boxShadow: '0 4px 6px -1px rgba(0,0,0,0.1)',
+          display: 'flex',
+          flexDirection: 'column',
+          height: 'fit-content',
+          maxHeight: '80vh'
+        }}>
+          <EventStreamViewer events={events} />
+        </div>
+      </div>
+
+      <style>{`
+        @keyframes spin {
+          0% { transform: rotate(0deg); }
+          100% { transform: rotate(360deg); }
+        }
+        @keyframes pulse {
+          0%, 100% { opacity: 1; }
+          50% { opacity: 0.5; }
+        }
+      `}</style>
+    </div>
+  );
+}
+#################################################
+import React, { useState, useRef, useEffect } from 'react';
+
+const EventStreamViewer = ({ events }) => {
+  const [activeTab, setActiveTab] = useState('all');
+  const [autoScroll, setAutoScroll] = useState(true);
+  const endRef = useRef(null);
+
+  useEffect(() => {
+    if (autoScroll && endRef.current) {
+      endRef.current.scrollIntoView({ behavior: 'smooth' });
+    }
+  }, [events, autoScroll]);
+
+  const renderEventContent = (event) => {
+    switch (event.type) {
+      case 'run_start':
+        return (
+          <div style={{ color: '#3b82f6', display: 'flex', alignItems: 'center', gap: 8 }}>
+            <div style={{ fontSize: '1.2em' }}>🚀</div>
+            <div>
+              <strong>Starting query execution</strong>
+              <div style={{ fontSize: 14, color: '#64748b', marginTop: 4 }}>
+                "{event.data.query}"
+              </div>
+            </div>
+          </div>
+        );
+
+      case 'plan_generation':
+        if (event.data.status === 'started') {
+          return (
+            <div style={{ color: '#f59e0b', display: 'flex', alignItems: 'center', gap: 8 }}>
+              <div style={{ fontSize: '1.2em' }}>📋</div>
+              <div>
+                <strong>Generating execution plan...</strong>
+              </div>
+            </div>
+          );
+        } else {
+          return (
+            <div style={{ color: '#10b981', display: 'flex', alignItems: 'center', gap: 8 }}>
+              <div style={{ fontSize: '1.2em' }}>✅</div>
+              <div>
+                <strong>Execution plan generated</strong>
+                <div style={{ fontSize: 14, color: '#64748b', marginTop: 4 }}>
+                  {event.data.message}
+                </div>
+                {event.data.plan && (
+                  <div style={{ marginTop: 8 }}>
+                    {event.data.plan.map((step, index) => (
+                      <div key={index} style={{ 
+                        background: '#f8fafc', 
+                        padding: 8, 
+                        borderRadius: 6, 
+                        marginTop: 4,
+                        borderLeft: '3px solid #3b82f6'
+                      }}>
+                        <div><strong>Step {index + 1}:</strong> {step.tool}</div>
+                        {step.arguments && Object.keys(step.arguments).length > 0 && (
+                          <div style={{ fontSize: 12, color: '#64748b', marginTop: 4 }}>
+                            Arguments: {JSON.stringify(step.arguments)}
+                          </div>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+          );
+        }
+
+      case 'tool_start':
+        return (
+          <div style={{ color: '#8b5cf6', display: 'flex', alignItems: 'center', gap: 8 }}>
+            <div style={{ fontSize: '1.2em' }}>🛠️</div>
+            <div>
+              <strong>Executing tool {event.data.step}/{event.data.total_steps}</strong>
+              <div style={{ fontSize: 14, color: '#64748b', marginTop: 4 }}>
+                Tool: <code>{event.data.tool}</code>
+              </div>
+            </div>
+          </div>
+        );
+
+      case 'tool_result':
+        const result = event.data.result;
+        return (
+          <div style={{ color: '#10b981', display: 'flex', alignItems: 'flex-start', gap: 8 }}>
+            <div style={{ fontSize: '1.2em' }}>✅</div>
+            <div style={{ flex: 1 }}>
+              <strong>Tool completed</strong>
+              <div style={{ fontSize: 14, color: '#64748b', marginTop: 4 }}>
+                Tool: <code>{event.data.tool}</code>
+              </div>
+              {result && (
+                <div style={{ marginTop: 8 }}>
+                  {result.error ? (
+                    <div style={{ 
+                      background: '#fef2f2', 
+                      padding: 12, 
+                      borderRadius: 6,
+                      border: '1px solid #fecaca',
+                      color: '#dc2626'
+                    }}>
+                      <strong>Error:</strong> {result.error}
+                    </div>
+                  ) : result.data ? (
+                    <pre style={{ 
+                      background: '#1e293b', 
+                      color: 'white', 
+                      padding: 12, 
+                      borderRadius: 6, 
+                      overflow: 'auto',
+                      fontSize: 12,
+                      marginTop: 8,
+                      maxHeight: 200
+                    }}>
+                      {JSON.stringify(result.data, null, 2)}
+                    </pre>
+                  ) : (
+                    <div style={{ 
+                      background: '#f8fafc', 
+                      padding: 12, 
+                      borderRadius: 6,
+                      color: '#64748b',
+                      fontSize: 14
+                    }}>
+                      No data returned
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          </div>
+        );
+
+      case 'tool_error':
+        return (
+          <div style={{ color: '#ef4444', display: 'flex', alignItems: 'flex-start', gap: 8 }}>
+            <div style={{ fontSize: '1.2em' }}>❌</div>
+            <div style={{ flex: 1 }}>
+              <strong>Tool execution failed</strong>
+              <div style={{ fontSize: 14, color: '#64748b', marginTop: 4 }}>
+                Tool: <code>{event.data.tool}</code>
+              </div>
+              <div style={{ 
+                background: '#fef2f2', 
+                padding: 12, 
+                borderRadius: 6,
+                border: '1px solid #fecaca',
+                color: '#dc2626',
+                marginTop: 8
+              }}>
+                <strong>Error:</strong> {event.data.error}
+              </div>
+            </div>
+          </div>
+        );
+
+      case 'summary_generation':
+        if (event.data.status === 'started') {
+          return (
+            <div style={{ color: '#f59e0b', display: 'flex', alignItems: 'center', gap: 8 }}>
+              <div style={{ fontSize: '1.2em' }}>📊</div>
+              <div>
+                <strong>Generating summary...</strong>
+              </div>
+            </div>
+          );
+        } else {
+          return (
+            <div style={{ color: '#10b981', display: 'flex', alignItems: 'flex-start', gap: 8 }}>
+              <div style={{ fontSize: '1.2em' }}>📊</div>
+              <div style={{ flex: 1 }}>
+                <strong>Summary generated</strong>
+                {event.data.summary && (
+                  <div style={{ 
+                    background: '#f0f9ff', 
+                    padding: 16, 
+                    borderRadius: 8,
+                    border: '1px solid #bae6fd',
+                    marginTop: 8
+                  }}>
+                    <div style={{ lineHeight: 1.6, color: '#0369a1' }}>
+                      {event.data.summary.summary || 'No summary available'}
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
+          );
+        }
+
+      case 'run_complete':
+        return (
+          <div style={{ color: '#059669', display: 'flex', alignItems: 'center', gap: 8 }}>
+            <div style={{ fontSize: '1.2em' }}>🎉</div>
+            <div>
+              <strong>Query execution completed successfully!</strong>
+              <div style={{ fontSize: 14, color: '#64748b', marginTop: 4 }}>
+                Processed {event.data.plan?.length || 0} steps
+              </div>
+            </div>
+          </div>
+        );
+
+      case 'error':
+        return (
+          <div style={{ color: '#ef4444', display: 'flex', alignItems: 'flex-start', gap: 8 }}>
+            <div style={{ fontSize: '1.2em' }}>💥</div>
+            <div>
+              <strong>Error occurred</strong>
+              <div style={{ 
+                background: '#fef2f2', 
+                padding: 12, 
+                borderRadius: 6,
+                border: '1px solid #fecaca',
+                color: '#dc2626',
+                marginTop: 8
+              }}>
+                {event.data.message}
+              </div>
+            </div>
+          </div>
+        );
+
+      default:
+        return (
+          <div style={{ display: 'flex', alignItems: 'flex-start', gap: 8 }}>
+            <div style={{ fontSize: '1.2em' }}>📄</div>
+            <div style={{ flex: 1 }}>
+              <pre style={{ fontSize: 12, margin: 0 }}>
+                {JSON.stringify(event, null, 2)}
+              </pre>
+            </div>
+          </div>
+        );
+    }
+  };
+
+  const filteredEvents = events.filter(event => {
+    if (activeTab === 'all') return true;
+    return event.type === activeTab;
+  });
+
+  const eventTypes = [
+    { key: 'all', label: 'All Events', count: events.length, emoji: '📋' },
+    { key: 'run_start', label: 'Start', count: events.filter(e => e.type === 'run_start').length, emoji: '🚀' },
+    { key: 'plan_generation', label: 'Plan', count: events.filter(e => e.type === 'plan_generation').length, emoji: '📋' },
+    { key: 'tool_start', label: 'Tools', count: events.filter(e => e.type === 'tool_start').length, emoji: '🛠️' },
+    { key: 'tool_result', label: 'Results', count: events.filter(e => e.type === 'tool_result').length, emoji: '✅' },
+    { key: 'summary_generation', label: 'Summary', count: events.filter(e => e.type === 'summary_generation').length, emoji: '📊' },
+    { key: 'error', label: 'Errors', count: events.filter(e => e.type === 'error' || e.type === 'tool_error').length, emoji: '❌' }
+  ];
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
+      {/* Header */}
+      <div style={{ 
+        padding: 20, 
+        borderBottom: '1px solid #e2e8f0',
+        display: 'flex',
+        justifyContent: 'space-between',
+        alignItems: 'center',
+        flexWrap: 'wrap',
+        gap: 12
+      }}>
+        <h2 style={{ margin: 0, color: '#1e293b', fontSize: 20 }}>Execution Events</h2>
+        
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+          <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 14, color: '#64748b' }}>
+            <input
+              type="checkbox"
+              checked={autoScroll}
+              onChange={(e) => setAutoScroll(e.target.checked)}
+              style={{ margin: 0 }}
+            />
+            Auto-scroll
+          </label>
+          
+          <div style={{ display: 'flex', background: '#f1f5f9', padding: 4, borderRadius: 8 }}>
+            {eventTypes.map(({ key, label, count, emoji }) => (
+              <button
+                key={key}
+                onClick={() => setActiveTab(key)}
+                style={{
+                  padding: '8px 12px',
+                  border: 'none',
+                  background: activeTab === key ? 'white' : 'transparent',
+                  borderRadius: 6,
+                  cursor: 'pointer',
+                  fontSize: 12,
+                  color: activeTab === key ? '#3b82f6' : '#64748b',
+                  boxShadow: activeTab === key ? '0 1px 3px rgba(0,0,0,0.1)' : 'none',
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 6,
+                  fontWeight: 600
+                }}
+              >
+                <span>{emoji}</span>
+                {label} ({count})
+              </button>
+            ))}
+          </div>
+        </div>
+      </div>
+
+      {/* Events List */}
+      <div style={{ 
+        padding: 20, 
+        flex: 1, 
+        overflowY: 'auto',
+        background: '#f8fafc'
+      }}>
+        {filteredEvents.length === 0 ? (
+          <div style={{ 
+            textAlign: 'center', 
+            color: '#94a3b8', 
+            padding: 40,
+            fontStyle: 'italic'
+          }}>
+            No events to display. Run a query to see execution events.
+          </div>
+        ) : (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+            {filteredEvents.map((event, index) => (
+              <div
+                key={index}
+                style={{
+                  padding: 20,
+                  background: 'white',
+                  borderRadius: 12,
+                  border: '1px solid #e2e8f0',
+                  boxShadow: '0 1px 3px rgba(0,0,0,0.05)'
+                }}
+              >
+                <div style={{ 
+                  display: 'flex', 
+                  justifyContent: 'space-between',
+                  alignItems: 'flex-start',
+                  marginBottom: 12
+                }}>
+                  <div style={{ 
+                    fontSize: 12, 
+                    color: '#64748b',
+                    fontFamily: 'monospace',
+                    background: '#f1f5f9',
+                    padding: '4px 8px',
+                    borderRadius: 4
+                  }}>
+                    {new Date(event.timestamp).toLocaleTimeString()}
+                  </div>
+                  <span style={{ 
+                    fontSize: 11, 
+                    background: '#e0f2fe', 
+                    padding: '4px 8px', 
+                    borderRadius: 12,
+                    color: '#0369a1',
+                    fontWeight: 600,
+                    textTransform: 'uppercase',
+                    letterSpacing: 0.5
+                  }}>
+                    {event.type}
+                  </span>
+                </div>
+                {renderEventContent(event)}
+              </div>
+            ))}
+            <div ref={endRef} />
+          </div>
+        )}
+      </div>
+    </div>
+  );
+};
+
+export default EventStreamViewer;
+#################################################################
+VITE_AGENT_ENDPOINT=http://localhost:8001/agent
+#######################################################
+{
+  "name": "flightops-agui-client",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --port 5173",
+    "build": "vite build",
+    "lint": "eslint . --ext js,jsx --report-unused-disable-directives --max-warnings 0",
+    "preview": "vite preview --port 5173"
+  },
+  "dependencies": {
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.2.1",
+    "vite": "^5.0.8"
+  }
+}
+
+#############################################
 import json, uuid
 from datetime import datetime
 
