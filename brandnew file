@@ -1,3 +1,380 @@
+import json
+import uuid
+from datetime import datetime
+from typing import Dict, List, Any, Optional, Union
+from dataclasses import dataclass, asdict
+from enum import Enum
+
+
+class EventType(str, Enum):
+    """AG-UI protocol event types"""
+    TEXT_MESSAGE_START = "TEXT_MESSAGE_START"
+    TEXT_MESSAGE_CONTENT = "TEXT_MESSAGE_CONTENT"
+    TEXT_MESSAGE_END = "TEXT_MESSAGE_END"
+    TOOL_CALL_START = "TOOL_CALL_START"
+    TOOL_CALL_ARGS = "TOOL_CALL_ARGS"
+    TOOL_CALL_RESULT = "TOOL_CALL_RESULT"
+    TOOL_CALL_END = "TOOL_CALL_END"
+    STATE_DELTA = "STATE_DELTA"
+    RUN_STARTED = "RUN_STARTED"
+    RUN_FINISHED = "RUN_FINISHED"
+    RUN_ERROR = "RUN_ERROR"
+
+
+@dataclass
+class BaseEvent:
+    """Base event class with common properties"""
+    type: EventType
+    ts: Optional[str] = None
+    
+    def __post_init__(self):
+        if self.ts is None:
+            self.ts = datetime.utcnow().isoformat() + "Z"
+
+
+@dataclass
+class TextMessageStartEvent(BaseEvent):
+    """Start of a text message from assistant or user"""
+    messageId: str
+    role: str = "assistant"
+    type: EventType = EventType.TEXT_MESSAGE_START
+
+
+@dataclass
+class TextMessageContentEvent(BaseEvent):
+    """Content chunk of a text message"""
+    messageId: str
+    text: str
+    type: EventType = EventType.TEXT_MESSAGE_CONTENT
+
+
+@dataclass
+class TextMessageEndEvent(BaseEvent):
+    """End of a text message"""
+    messageId: str
+    type: EventType = EventType.TEXT_MESSAGE_END
+
+
+@dataclass
+class ToolCallStartEvent(BaseEvent):
+    """Start of a tool call"""
+    toolCallId: str
+    name: str
+    type: EventType = EventType.TOOL_CALL_START
+
+
+@dataclass
+class ToolCallArgsEvent(BaseEvent):
+    """Arguments for a tool call"""
+    toolCallId: str
+    args: Dict[str, Any]
+    type: EventType = EventType.TOOL_CALL_ARGS
+
+
+@dataclass
+class ToolCallResultEvent(BaseEvent):
+    """Result from a tool call"""
+    toolCallId: str
+    result: Any
+    type: EventType = EventType.TOOL_CALL_RESULT
+
+
+@dataclass
+class ToolCallEndEvent(BaseEvent):
+    """End of a tool call"""
+    toolCallId: str
+    ok: bool = True
+    type: EventType = EventType.TOOL_CALL_END
+
+
+@dataclass
+class StateDeltaOperation:
+    """Individual state delta operation"""
+    op: str  # "add", "remove", "replace", "move", "copy", "test"
+    path: str
+    value: Any
+
+
+@dataclass
+class StateDeltaEvent(BaseEvent):
+    """State delta update"""
+    ops: List[StateDeltaOperation]
+    type: EventType = EventType.STATE_DELTA
+
+
+@dataclass
+class RunStartedEvent(BaseEvent):
+    """Run started event"""
+    thread_id: str
+    run_id: str
+    type: EventType = EventType.RUN_STARTED
+
+
+@dataclass
+class RunFinishedEvent(BaseEvent):
+    """Run finished event"""
+    thread_id: str
+    run_id: str
+    type: EventType = EventType.RUN_FINISHED
+
+
+@dataclass
+class RunErrorEvent(BaseEvent):
+    """Run error event"""
+    message: str
+    type: EventType = EventType.RUN_ERROR
+
+
+class EventEncoder:
+    """Encoder for AG-UI events to NDJSON format"""
+    
+    def encode(self, event: BaseEvent) -> bytes:
+        """Convert event to NDJSON bytes"""
+        if isinstance(event, StateDeltaEvent):
+            # Convert StateDeltaEvent with nested operations
+            event_dict = {
+                "type": event.type.value,
+                "ts": event.ts,
+                "ops": [asdict(op) for op in event.ops]
+            }
+        else:
+            # Convert other events
+            event_dict = asdict(event)
+            # Convert Enum to string value
+            event_dict["type"] = event.type.value
+        
+        return ndjson(event_dict)
+
+
+def ndjson(ev: Dict[str, Any]) -> bytes:
+    """
+    Convert event dictionary to NDJSON format bytes.
+    
+    Args:
+        ev: Event dictionary
+        
+    Returns:
+        NDJSON formatted bytes
+    """
+    return (json.dumps(ev, ensure_ascii=False, separators=(',', ':')) + "\n").encode("utf-8")
+
+
+def text_start(message_id: str, role: str = "assistant") -> TextMessageStartEvent:
+    """
+    Create a TEXT_MESSAGE_START event.
+    
+    Args:
+        message_id: Unique message identifier
+        role: Message role ("user" or "assistant")
+        
+    Returns:
+        TextMessageStartEvent
+    """
+    return TextMessageStartEvent(messageId=message_id, role=role)
+
+
+def text_content(message_id: str, text: str) -> TextMessageContentEvent:
+    """
+    Create a TEXT_MESSAGE_CONTENT event.
+    
+    Args:
+        message_id: Unique message identifier
+        text: Text content
+        
+    Returns:
+        TextMessageContentEvent
+    """
+    # Ensure text is string
+    if not isinstance(text, str):
+        try:
+            text = text.get("summary", "") if hasattr(text, "get") else str(text)
+        except Exception:
+            text = json.dumps(text, ensure_ascii=False)
+    
+    return TextMessageContentEvent(messageId=message_id, text=text)
+
+
+def text_end(message_id: str) -> TextMessageEndEvent:
+    """
+    Create a TEXT_MESSAGE_END event.
+    
+    Args:
+        message_id: Unique message identifier
+        
+    Returns:
+        TextMessageEndEvent
+    """
+    return TextMessageEndEvent(messageId=message_id)
+
+
+def tool_start(tool_call_id: str, name: str) -> ToolCallStartEvent:
+    """
+    Create a TOOL_CALL_START event.
+    
+    Args:
+        tool_call_id: Unique tool call identifier
+        name: Tool name
+        
+    Returns:
+        ToolCallStartEvent
+    """
+    return ToolCallStartEvent(toolCallId=tool_call_id, name=name)
+
+
+def tool_args(tool_call_id: str, args: Dict[str, Any]) -> ToolCallArgsEvent:
+    """
+    Create a TOOL_CALL_ARGS event.
+    
+    Args:
+        tool_call_id: Unique tool call identifier
+        args: Tool arguments
+        
+    Returns:
+        ToolCallArgsEvent
+    """
+    return ToolCallArgsEvent(toolCallId=tool_call_id, args=args)
+
+
+def tool_result(tool_call_id: str, result: Any) -> ToolCallResultEvent:
+    """
+    Create a TOOL_CALL_RESULT event.
+    
+    Args:
+        tool_call_id: Unique tool call identifier
+        result: Tool execution result
+        
+    Returns:
+        ToolCallResultEvent
+    """
+    return ToolCallResultEvent(toolCallId=tool_call_id, result=result)
+
+
+def tool_end(tool_call_id: str, ok: bool = True) -> ToolCallEndEvent:
+    """
+    Create a TOOL_CALL_END event.
+    
+    Args:
+        tool_call_id: Unique tool call identifier
+        ok: Whether tool call succeeded
+        
+    Returns:
+        ToolCallEndEvent
+    """
+    return ToolCallEndEvent(toolCallId=tool_call_id, ok=ok)
+
+
+def state_delta(ops: List[Dict[str, Any]]) -> StateDeltaEvent:
+    """
+    Create a STATE_DELTA event.
+    
+    Args:
+        ops: List of state delta operations
+        
+    Returns:
+        StateDeltaEvent
+    """
+    operations = []
+    for op in ops:
+        operations.append(StateDeltaOperation(
+            op=op["op"],
+            path=op["path"],
+            value=op["value"]
+        ))
+    
+    return StateDeltaEvent(ops=operations)
+
+
+def new_ids() -> tuple[str, str]:
+    """
+    Generate new unique IDs for message and tool call.
+    
+    Returns:
+        Tuple of (message_id, tool_call_id)
+    """
+    return str(uuid.uuid4()), str(uuid.uuid4())
+
+
+def run_started(thread_id: str, run_id: str) -> RunStartedEvent:
+    """
+    Create a RUN_STARTED event.
+    
+    Args:
+        thread_id: Thread identifier
+        run_id: Run identifier
+        
+    Returns:
+        RunStartedEvent
+    """
+    return RunStartedEvent(thread_id=thread_id, run_id=run_id)
+
+
+def run_finished(thread_id: str, run_id: str) -> RunFinishedEvent:
+    """
+    Create a RUN_FINISHED event.
+    
+    Args:
+        thread_id: Thread identifier
+        run_id: Run identifier
+        
+    Returns:
+        RunFinishedEvent
+    """
+    return RunFinishedEvent(thread_id=thread_id, run_id=run_id)
+
+
+def run_error(message: str) -> RunErrorEvent:
+    """
+    Create a RUN_ERROR event.
+    
+    Args:
+        message: Error message
+        
+    Returns:
+        RunErrorEvent
+    """
+    return RunErrorEvent(message=message)
+
+
+# Backward compatibility functions for existing code
+def create_event_encoder() -> EventEncoder:
+    """Create a new event encoder instance"""
+    return EventEncoder()
+
+
+# Example usage and testing
+if __name__ == "__main__":
+    # Test event creation and encoding
+    encoder = EventEncoder()
+    
+    # Create sample events
+    message_id, tool_id = new_ids()
+    
+    events = [
+        text_start(message_id),
+        text_content(message_id, "Hello, this is a test message!"),
+        text_end(message_id),
+        tool_start(tool_id, "get_flight_basic_info"),
+        tool_args(tool_id, {"carrier": "6E", "flight_number": "215"}),
+        tool_result(tool_id, {"ok": True, "data": {"flight": "6E215"}}),
+        tool_end(tool_id, True),
+        state_delta([{"op": "add", "path": "/lastPlan", "value": ["tool1", "tool2"]}]),
+        run_started("thread_1", "run_1"),
+        run_finished("thread_1", "run_1"),
+        run_error("Something went wrong")
+    ]
+    
+    print("🧪 Testing AG-UI Event Encoding:")
+    print("=" * 50)
+    
+    for event in events:
+        encoded = encoder.encode(event)
+        print(f"📨 {event.type.value}:")
+        print(f"   {encoded.decode('utf-8').strip()}")
+        print()
+    
+    print("✅ All events encoded successfully!")
+#############################################################################
+
 import { useState, useEffect, useRef } from 'react';
 
 export default function Chat({ messages }) {
