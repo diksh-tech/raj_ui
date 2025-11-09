@@ -1,3 +1,99 @@
+import { useState, useEffect, useRef } from 'react';
+
+export default function Chat({ messages }) {
+  const messagesEndRef = useRef(null);
+
+  const scrollToBottom = () => {
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  };
+
+  useEffect(() => {
+    scrollToBottom();
+  }, [messages]);
+
+  const formatMessageContent = (content) => {
+    if (!content) return '';
+    
+    // Convert markdown-style bullets to HTML
+    return content
+      .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
+      .replace(/\n/g, '<br />');
+  };
+
+  return (
+    <div style={{ 
+      height: '400px', 
+      overflowY: 'auto',
+      padding: '16px',
+      backgroundColor: 'white',
+      borderRadius: '12px',
+      border: '1px solid #e1e5e9',
+      boxShadow: '0 2px 8px rgba(0,0,0,0.1)'
+    }}>
+      {messages.length === 0 ? (
+        <div style={{
+          display: 'flex',
+          flexDirection: 'column',
+          alignItems: 'center',
+          justifyContent: 'center',
+          height: '100%',
+          color: '#6c757d',
+          textAlign: 'center'
+        }}>
+          <div style={{ fontSize: '48px', marginBottom: '16px' }}>✈️</div>
+          <h3 style={{ margin: '0 0 8px 0', color: '#495057' }}>FlightOps AG-UI</h3>
+          <p style={{ margin: 0, fontSize: '14px' }}>
+            Ask about flight data, delays, equipment, or analytics...
+          </p>
+        </div>
+      ) : (
+        messages.map((m, i) => (
+          <div 
+            key={i} 
+            style={{ 
+              display: 'flex',
+              marginBottom: '16px',
+              justifyContent: m.role === 'user' ? 'flex-end' : 'flex-start'
+            }}
+          >
+            <div 
+              style={{ 
+                maxWidth: '70%',
+                padding: '12px 16px',
+                borderRadius: '18px',
+                backgroundColor: m.role === 'user' ? '#007bff' : '#f8f9fa',
+                color: m.role === 'user' ? 'white' : '#212529',
+                border: m.role === 'user' ? 'none' : '1px solid #dee2e6',
+                boxShadow: '0 1px 3px rgba(0,0,0,0.1)'
+              }}
+            >
+              <div style={{ 
+                fontSize: '12px', 
+                fontWeight: 'bold', 
+                marginBottom: '4px',
+                color: m.role === 'user' ? 'rgba(255,255,255,0.9)' : '#6c757d'
+              }}>
+                {m.role === 'user' ? 'You' : 'FlightOps Assistant'}
+              </div>
+              <div 
+                dangerouslySetInnerHTML={{ 
+                  __html: formatMessageContent(m.content) 
+                }}
+                style={{ 
+                  lineHeight: '1.5',
+                  whiteSpace: 'pre-wrap'
+                }}
+              />
+            </div>
+          </div>
+        ))
+      )}
+      <div ref={messagesEndRef} />
+    </div>
+  );
+}
+
+############################################
 import os
 import logging
 import json
