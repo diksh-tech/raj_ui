@@ -1,3 +1,44 @@
+import json, uuid
+from datetime import datetime
+
+def ndjson(ev: dict) -> bytes:
+    return (json.dumps(ev, ensure_ascii=False) + "\n").encode("utf-8")
+
+def text_start(message_id: str, role="assistant"):
+    return {"type":"TEXT_MESSAGE_START","messageId":message_id,"role":role,"ts":datetime.utcnow().isoformat()+"Z"}
+
+def text_content(message_id: str, text: str):
+    if not isinstance(text, str):
+        try:
+            text = text.get("summary", "")
+        except Exception:
+            import json as _json
+            text = _json.dumps(text, ensure_ascii=False)
+    return {"type":"TEXT_MESSAGE_CONTENT","messageId":message_id,"text":text}
+
+def text_end(message_id: str):
+    return {"type":"TEXT_MESSAGE_END","messageId":message_id}
+
+def tool_start(tool_call_id: str, name: str):
+    return {"type":"TOOL_CALL_START","toolCallId":tool_call_id,"name":name}
+
+def tool_args(tool_call_id: str, args: dict):
+    return {"type":"TOOL_CALL_ARGS","toolCallId":tool_call_id,"args":args}
+
+def tool_result(tool_call_id: str, result):
+    return {"type":"TOOL_CALL_RESULT","toolCallId":tool_call_id,"result":result}
+
+def tool_end(tool_call_id: str, ok=True):
+    return {"type":"TOOL_CALL_END","toolCallId":tool_call_id,"ok":ok}
+
+def state_delta(patch_ops: list):
+    return {"type":"STATE_DELTA","ops":patch_ops}
+
+def new_ids():
+    return str(uuid.uuid4()), str(uuid.uuid4())
+#################################################
+
+
 import json
 import uuid
 from datetime import datetime
